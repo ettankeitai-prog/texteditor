@@ -1,0 +1,59 @@
+{
+  "name": "texteditor",
+  "version": "1.4.0",
+  "private": true,
+  "description": "A lightweight VSCode-style text editor for novels and notes.",
+  "author": "Local",
+  "main": "dist/main/main.js",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "build": "tsc --noEmit && npm run build:main && npm run build:renderer",
+    "build:main": "tsc -p tsconfig.node.json",
+    "build:renderer": "vite build",
+    "preview": "vite preview --host 127.0.0.1",
+    "electron": "npm run build && electron .",
+    "start": "npm run electron",
+    "test:e2e": "npm run build && playwright test",
+    "dist": "npm run build && electron-builder --win",
+    "test:e2e:ui": "npm run build && playwright test --ui"
+  },
+  "build": {
+    "appId": "com.local.texteditor",
+    "productName": "Text Editor",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "dist/main/**",
+      "dist/preload/**",
+      "dist/renderer/**",
+      "dist/shared/**",
+      "node_modules/adm-zip/**",
+      "package.json"
+    ],
+    "win": {
+      "target": [
+        "nsis",
+        "portable"
+      ]
+    }
+  },
+  "dependencies": {
+    "@codemirror/commands": "^6.8.1",
+    "@codemirror/lang-markdown": "^6.3.4",
+    "@codemirror/search": "^6.7.1",
+    "@codemirror/state": "^6.5.2",
+    "@codemirror/view": "^6.38.0",
+    "adm-zip": "^0.5.18"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.61.1",
+    "@types/adm-zip": "^0.5.8",
+    "@types/node": "^20.19.6",
+    "electron": "^43.0.0",
+    "electron-builder": "^26.15.3",
+    "playwright": "^1.61.1",
+    "typescript": "^5.8.3",
+    "vite": "^8.1.3"
+  }
+}
