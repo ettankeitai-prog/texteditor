@@ -1,6 +1,6 @@
 {
   "name": "texteditor",
-  "version": "1.5.0",
+  "version": "1.5.1",
   "private": true,
   "description": "A lightweight VSCode-style text editor for novels and notes.",
   "author": "Local",

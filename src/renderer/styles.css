@@ -371,7 +371,7 @@ body.is-resizing {
   text-align: left;
 }
 
-.tab-title span {
+.tab-name {
   width: 100%;
   overflow: hidden;
   text-overflow: ellipsis;

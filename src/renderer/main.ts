@@ -1431,7 +1431,7 @@ function renderTabRows(tabIds: string[], groupId: string | null): string {
       (tab) => `
         <div class="tab-row ${tab.id === activeTabId ? "is-active" : ""}" data-id="${tab.id}" data-group-id="${groupId ?? UNGROUPED_GROUP_ID}" draggable="true">
           <button type="button" class="tab-title" data-action="activate-tab" data-id="${tab.id}">
-            <span>${tab.pinned ? `<span class="pin-mark" aria-hidden="true">●</span>` : ""}${escapeHtml(tab.title)}</span>
+            <span class="tab-name">${tab.pinned ? `<span class="pin-mark" aria-hidden="true">●</span>` : ""}${escapeHtml(tab.title)}</span>
             <small>${tab.wordCount} ${text().words}</small>
           </button>
         </div>
