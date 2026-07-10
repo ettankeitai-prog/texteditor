@@ -273,6 +273,7 @@ function normalizeWorkspace(input: Partial<WorkspaceState>): WorkspaceState {
     locale: input.locale === "jp" ? "jp" : "en",
     fontSize: typeof input.fontSize === "number" ? input.fontSize : defaultWorkspace.fontSize,
     sidebarWidth: Math.min(420, Math.max(160, typeof input.sidebarWidth === "number" ? input.sidebarWidth : defaultWorkspace.sidebarWidth)),
+    autoContinueLists: typeof input.autoContinueLists === "boolean" ? input.autoContinueLists : defaultWorkspace.autoContinueLists,
     newTabTemplate: normalizeNewTabTemplate(input.newTabTemplate),
     templates: {
       ...defaultWorkspace.templates,
@@ -713,7 +714,8 @@ ipcMain.handle("tab:save", async (_event, tab: TabDocument): Promise<TabDocument
     id: normalized.id,
     title: normalized.title,
     updatedAt,
-    wordCount: countWords(getMainChildTab(normalized).content)
+    wordCount: countWords(getMainChildTab(normalized).content),
+    pinned: index.tabs.find((entry) => entry.id === tab.id)?.pinned ?? false
   };
   const tabs = index.tabs.some((entry) => entry.id === tab.id)
     ? index.tabs.map((entry) => (entry.id === tab.id ? meta : entry))

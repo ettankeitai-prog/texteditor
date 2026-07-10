@@ -104,6 +104,7 @@ button:hover {
   display: grid;
   grid-template-columns: 248px 5px minmax(0, 1fr) 86px;
   min-height: 0;
+  border-top: 1px solid var(--border);
 }
 
 .sidebar {
@@ -377,6 +378,15 @@ body.is-resizing {
   white-space: nowrap;
 }
 
+.pin-mark {
+  display: inline-block;
+  width: 10px;
+  margin-right: 4px;
+  color: var(--accent);
+  font-size: 8px;
+  vertical-align: 1px;
+}
+
 .tab-title small {
   color: var(--muted);
   font-size: 10px;
@@ -598,9 +608,18 @@ body.is-split-resizing {
   gap: 16px;
   padding: 0 10px;
   overflow: hidden;
-  background: var(--accent);
-  color: #ffffff;
+  border-top: 1px solid var(--border);
+  background: var(--panel-2);
+  color: var(--muted);
   font-size: 11px;
+}
+
+.status-bar[data-mode="dirty"] {
+  color: var(--accent);
+}
+
+.status-bar[data-mode="error"] {
+  color: var(--danger);
 }
 
 .status-bar span {
@@ -754,6 +773,14 @@ body.is-split-resizing {
 .template-name-input:disabled {
   color: var(--muted);
   opacity: 0.9;
+}
+
+.settings-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text);
+  font-size: 12px;
 }
 
 .modal-list {

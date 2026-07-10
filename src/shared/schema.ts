@@ -30,6 +30,7 @@ export interface WorkspaceState {
   locale: Locale;
   fontSize: number;
   sidebarWidth: number;
+  autoContinueLists: boolean;
   newTabTemplate: NewTabTemplateId;
   templates: WorkspaceTemplates;
   layout: WorkspaceLayout;
@@ -40,6 +41,7 @@ export interface TabMeta {
   title: string;
   updatedAt: string;
   wordCount: number;
+  pinned?: boolean;
 }
 
 export interface TabsIndex {
@@ -136,6 +138,7 @@ export const defaultWorkspace: WorkspaceState = {
   locale: "en",
   fontSize: 15,
   sidebarWidth: 248,
+  autoContinueLists: true,
   newTabTemplate: "simple",
   templates: {
     custom: [MAIN_CHILD_TAB_TITLE]
@@ -172,7 +175,15 @@ export function countWords(content: string): number {
 }
 
 export function normalizeTabsIndex(input: Partial<TabsIndex>): TabsIndex {
-  const tabs = Array.isArray(input.tabs) ? input.tabs : [];
+  const tabs = (Array.isArray(input.tabs) ? input.tabs : [])
+    .filter((tab) => tab && typeof tab.id === "string")
+    .map((tab, index) => ({
+      id: tab.id.trim() || `tab-${String(index + 1).padStart(3, "0")}`,
+      title: tab.title?.trim() || "Untitled",
+      updatedAt: typeof tab.updatedAt === "string" ? tab.updatedAt : new Date().toISOString(),
+      wordCount: typeof tab.wordCount === "number" ? tab.wordCount : 0,
+      pinned: Boolean(tab.pinned)
+    }));
   const validTabIds = new Set(tabs.map((tab) => tab.id));
   const usedTabIds = new Set<string>();
   const usedGroupIds = new Set<string>();

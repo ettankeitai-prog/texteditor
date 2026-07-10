@@ -1,7 +1,7 @@
 import { test, expect, type TestInfo } from "@playwright/test";
 import { _electron as electron, type ElectronApplication, type Page } from "playwright";
 import electronPath from "electron";
-import { mkdir, readFile, readdir, rm } from "node:fs/promises";
+import { mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 type TabDocument = {
@@ -16,7 +16,7 @@ type TabDocument = {
 type TabsIndex = {
   groups?: Array<{ id: string; title: string; tabIds: string[]; collapsed: boolean; updatedAt: string }>;
   ungroupedTabIds?: string[];
-  tabs: Array<{ id: string; title: string; updatedAt: string; wordCount: number }>;
+  tabs: Array<{ id: string; title: string; updatedAt: string; wordCount: number; pinned?: boolean }>;
 };
 
 const appRoot = path.resolve(__dirname, "..");
@@ -449,6 +449,77 @@ test.describe("Text Editor Electron MVP", () => {
         await expect(relaunched.page.locator(".tab-row").nth(0)).toContainText("Three");
         await expect(relaunched.page.locator(".tab-row").nth(1)).toContainText("One");
         await expect(relaunched.page.locator(".tab-row").nth(2)).toContainText("Two");
+      } finally {
+        await closeApp(relaunched.app);
+      }
+    } finally {
+      await closeApp(app);
+    }
+  });
+
+  test("pins tabs ahead of regular tabs and duplicates as an unpinned copy", async ({}, testInfo) => {
+    const { app, page, dataDir } = await launchTextEditor(testInfo);
+    try {
+      await page.locator("#active-title-input").fill("First");
+      await page.locator("#active-title-input").press("Enter");
+
+      await pressShortcut(page, "Control+N");
+      await page.locator("#active-title-input").fill("Second");
+      await page.locator("#active-title-input").press("Enter");
+      const secondId = await activeTabId(page);
+
+      await page.locator(".tab-row", { hasText: "Second" }).click({ button: "right" });
+      await page.getByRole("button", { name: "Pin" }).click();
+      await expect(page.locator(".tab-row").nth(0)).toContainText("Second");
+      await expect.poll(async () => (await readIndex(dataDir)).tabs.find((tab) => tab.id === secondId)?.pinned).toBe(true);
+
+      await page.locator(".tab-row", { hasText: "Second" }).first().click({ button: "right" });
+      await page.getByRole("button", { name: "Duplicate" }).click();
+      await expect(page.locator(".tab-row", { hasText: "Second - Copy" })).toHaveCount(1);
+      await expect(page.locator(".tab-row").nth(0)).toContainText("Second");
+
+      await expect.poll(async () => {
+        const copy = (await readIndex(dataDir)).tabs.find((tab) => tab.title === "Second - Copy");
+        return copy?.pinned ?? null;
+      }).toBe(false);
+
+      await page.locator(".tab-row", { hasText: "Second" }).first().click({ button: "right" });
+      await page.getByRole("button", { name: "Unpin" }).click();
+      await expect.poll(async () => (await readIndex(dataDir)).tabs.find((tab) => tab.id === secondId)?.pinned).toBe(false);
+    } finally {
+      await closeApp(app);
+    }
+  });
+
+  test("shows editor status metrics and can disable list continuation from saved settings", async ({}, testInfo) => {
+    const { app, page, userDataDir, dataDir } = await launchTextEditor(testInfo);
+    try {
+      const id = await activeTabId(page);
+      await replaceEditorText(page, "abc\nxy");
+      await expect(page.locator("#status-left")).toContainText("6 characters");
+      await expect(page.locator("#status-left")).toContainText("Ln 2, Col 3");
+
+      await pressShortcut(page, "Control+A");
+      await expect(page.locator("#status-left")).toContainText("Selection 6 characters");
+
+      await replaceEditorText(page, "- item");
+      await page.keyboard.press("Enter");
+      await waitForSavedTab(dataDir, id, "- item\n- ");
+
+      await replaceEditorText(page, "- ");
+      await page.keyboard.press("Enter");
+      await waitForSavedTab(dataDir, id, "");
+
+      await closeApp(app);
+      const workspace = await readWorkspace(dataDir);
+      await writeFile(path.join(dataDir, "workspace.json"), `${JSON.stringify({ ...workspace, autoContinueLists: false }, null, 2)}\n`, "utf8");
+
+      const relaunched = await launchTextEditor(testInfo, { clean: false, userDataDir });
+      try {
+        const relaunchedId = await activeTabId(relaunched.page);
+        await replaceEditorText(relaunched.page, "* item");
+        await relaunched.page.keyboard.press("Enter");
+        await waitForSavedTab(dataDir, relaunchedId, "* item\n");
       } finally {
         await closeApp(relaunched.app);
       }

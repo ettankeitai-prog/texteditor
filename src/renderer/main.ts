@@ -1,7 +1,7 @@
 import { defaultKeymap, history, historyKeymap, indentWithTab, redo, undo } from "@codemirror/commands";
 import { markdown } from "@codemirror/lang-markdown";
 import { findNext, findPrevious, openSearchPanel, search, searchKeymap } from "@codemirror/search";
-import { Compartment, EditorState, Transaction } from "@codemirror/state";
+import { Compartment, EditorState, Prec, Transaction } from "@codemirror/state";
 import { EditorView, highlightActiveLine, keymap, lineNumbers } from "@codemirror/view";
 import "./styles.css";
 import {
@@ -137,6 +137,7 @@ const rightChildTabBar = document.querySelector<HTMLDivElement>("#right-child-ta
 const activeTitleInput = document.querySelector<HTMLInputElement>("#active-title-input")!;
 const activeMeta = document.querySelector<HTMLDivElement>("#active-meta")!;
 const saveState = document.querySelector<HTMLDivElement>("#save-state")!;
+const statusBar = document.querySelector<HTMLElement>(".status-bar")!;
 const statusLeft = document.querySelector<HTMLSpanElement>("#status-left")!;
 const statusRight = document.querySelector<HTMLSpanElement>("#status-right")!;
 const minimap = document.querySelector<HTMLPreElement>("#minimap")!;
@@ -155,6 +156,8 @@ let globalSearchTimer: number | null = null;
 let globalSearchSequence = 0;
 let globalSearchCache: GlobalSearchResult[] = [];
 let workspaceImportedNeedsRestart = false;
+let statusContentCache = "";
+let statusCharacterCountCache = 0;
 
 const UNGROUPED_COLLAPSED_ID = "ungrouped:collapsed";
 
@@ -226,6 +229,8 @@ type UiText = {
   rename: string;
   close: string;
   duplicate: string;
+  pinTab: string;
+  unpinTab: string;
   removeFromGroup: string;
   openInMain: string;
   openInSub: string;
@@ -255,6 +260,7 @@ type UiText = {
   editCustomTemplate: string;
   customTemplateTitle: string;
   addTemplateItem: string;
+  autoContinueLists: string;
   templateSaved: string;
   recentClosed: string;
   restoreBackup: string;
@@ -292,6 +298,8 @@ type UiText = {
   newTabCreated: string;
   newTabFailed: string;
   tabDuplicated: string;
+  tabPinned: string;
+  tabUnpinned: string;
   txtImported: string;
   importTxtFailed: string;
   tabOrderSaved: string;
@@ -299,6 +307,9 @@ type UiText = {
   exportAllFailed: string;
   copied: string;
   copyFailed: string;
+  characters: string;
+  selectedCharacters: (count: number) => string;
+  lineColumn: (line: number, column: number) => string;
   actionFailed: string;
   startupFailed: string;
   languageChanged: string;
@@ -322,6 +333,8 @@ const uiText: Record<Locale, UiText> = {
     rename: "Rename",
     close: "Close",
     duplicate: "Duplicate",
+    pinTab: "Pin",
+    unpinTab: "Unpin",
     removeFromGroup: "Remove from Group",
     openInMain: "Open in Main",
     openInSub: "Open in Sub",
@@ -351,6 +364,7 @@ const uiText: Record<Locale, UiText> = {
     editCustomTemplate: "Edit custom template",
     customTemplateTitle: "Custom template",
     addTemplateItem: "Add",
+    autoContinueLists: "Continue lists automatically",
     templateSaved: "Template saved",
     recentClosed: "Recent / Closed",
     restoreBackup: "Restore Backup",
@@ -388,6 +402,8 @@ const uiText: Record<Locale, UiText> = {
     newTabCreated: "New tab created",
     newTabFailed: "New tab failed",
     tabDuplicated: "Tab duplicated",
+    tabPinned: "Tab pinned",
+    tabUnpinned: "Tab unpinned",
     txtImported: "TXT imported",
     importTxtFailed: "TXT import failed",
     tabOrderSaved: "Tab order saved",
@@ -395,6 +411,9 @@ const uiText: Record<Locale, UiText> = {
     exportAllFailed: "Export all failed",
     copied: "Copied",
     copyFailed: "Copy failed",
+    characters: "characters",
+    selectedCharacters: (count) => `Selection ${count} characters`,
+    lineColumn: (line, column) => `Ln ${line}, Col ${column}`,
     actionFailed: "Action failed",
     startupFailed: "Startup failed",
     languageChanged: "Language switched"
@@ -416,6 +435,8 @@ const uiText: Record<Locale, UiText> = {
     rename: "名前変更",
     close: "閉じる",
     duplicate: "複製",
+    pinTab: "ピン留め",
+    unpinTab: "ピン留めを解除",
     removeFromGroup: "グループから外す",
     openInMain: "メインで開く",
     openInSub: "サブで開く",
@@ -445,6 +466,7 @@ const uiText: Record<Locale, UiText> = {
     editCustomTemplate: "カスタムテンプレートを編集",
     customTemplateTitle: "カスタムテンプレート",
     addTemplateItem: "追加",
+    autoContinueLists: "箇条書きを自動継続",
     templateSaved: "テンプレートを保存しました",
     recentClosed: "最近閉じたタブ",
     restoreBackup: "バックアップから復元",
@@ -482,6 +504,8 @@ const uiText: Record<Locale, UiText> = {
     newTabCreated: "新規タブを作成しました",
     newTabFailed: "新規タブの作成に失敗しました",
     tabDuplicated: "タブを複製しました",
+    tabPinned: "タブをピン留めしました",
+    tabUnpinned: "ピン留めを解除しました",
     txtImported: "TXT を読み込みました",
     importTxtFailed: "TXT 読み込みに失敗しました",
     tabOrderSaved: "タブ順を保存しました",
@@ -489,6 +513,9 @@ const uiText: Record<Locale, UiText> = {
     exportAllFailed: "全タブ出力に失敗しました",
     copied: "コピーしました",
     copyFailed: "コピーに失敗しました",
+    characters: "文字",
+    selectedCharacters: (count) => `選択 ${count}文字`,
+    lineColumn: (line, column) => `Ln ${line}, Col ${column}`,
     actionFailed: "操作に失敗しました",
     startupFailed: "起動に失敗しました",
     languageChanged: "言語を切り替えました"
@@ -502,6 +529,8 @@ function text(): UiText {
 function setSaveState(message: string, mode: "idle" | "dirty" | "error" = "idle"): void {
   saveState.textContent = message;
   saveState.dataset.mode = mode;
+  statusBar.dataset.mode = mode;
+  updateStatusLine();
 }
 
 function errorMessage(error: unknown): string {
@@ -541,6 +570,35 @@ function tabMeta(id: string): TabMeta | undefined {
   return tabIndex.tabs.find((tab) => tab.id === id);
 }
 
+function isTabPinned(id: string): boolean {
+  return Boolean(tabMeta(id)?.pinned);
+}
+
+function orderTabIdsByPinned(tabIds: string[]): string[] {
+  const pinned: string[] = [];
+  const normal: string[] = [];
+  tabIds.forEach((id) => (isTabPinned(id) ? pinned : normal).push(id));
+  return [...pinned, ...normal];
+}
+
+function normalizePinnedOrderInIndex(index: TabsIndex): TabsIndex {
+  const pinnedById = new Map(index.tabs.map((tab) => [tab.id, Boolean(tab.pinned)]));
+  const orderIds = (tabIds: string[]): string[] => {
+    const pinned: string[] = [];
+    const normal: string[] = [];
+    tabIds.forEach((id) => (pinnedById.get(id) ? pinned : normal).push(id));
+    return [...pinned, ...normal];
+  };
+  return normalizeTabsIndex({
+    ...index,
+    groups: index.groups?.map((group) => ({
+      ...group,
+      tabIds: orderIds(group.tabIds)
+    })),
+    ungroupedTabIds: orderIds(index.ungroupedTabIds ?? [])
+  });
+}
+
 function groupForTab(tabId: string): TabGroup | null {
   return tabIndex.groups?.find((group) => group.tabIds.includes(tabId)) ?? null;
 }
@@ -566,8 +624,8 @@ function nextGroupId(): string {
 function flattenedOpenedTabIds(): string[] {
   const opened = new Set(workspace.openedTabIds);
   const ordered = [
-    ...(tabIndex.groups ?? []).flatMap((group) => group.tabIds),
-    ...(tabIndex.ungroupedTabIds ?? [])
+    ...(tabIndex.groups ?? []).flatMap((group) => orderTabIdsByPinned(group.tabIds)),
+    ...orderTabIdsByPinned(tabIndex.ungroupedTabIds ?? [])
   ].filter((id) => opened.has(id));
   const seen = new Set(ordered);
   return [...ordered, ...workspace.openedTabIds.filter((id) => !seen.has(id) && tabMeta(id))];
@@ -636,7 +694,7 @@ function expandTargetGroup(groupId: string | null): void {
 }
 
 async function saveTabsIndex(): Promise<void> {
-  tabIndex = normalizeTabsIndex(await window.textEditor.saveTabsIndex(tabIndex));
+  tabIndex = normalizePinnedOrderInIndex(await window.textEditor.saveTabsIndex(normalizePinnedOrderInIndex(tabIndex)));
 }
 
 function localizedMainChildTitle(): string {
@@ -808,7 +866,8 @@ function updateMetaFromDocument(tab: TabDocument): void {
     id: normalized.id,
     title: normalized.title,
     updatedAt: normalized.updatedAt,
-    wordCount: countWords(getMainChildTab(normalized).content)
+    wordCount: countWords(getMainChildTab(normalized).content),
+    pinned: tabIndex.tabs.find((entry) => entry.id === normalized.id)?.pinned ?? false
   };
   tabIndex = normalizeTabsIndex({
     ...tabIndex,
@@ -977,6 +1036,51 @@ function syncEditorTransaction(sourcePane: EditorPaneState, transaction: Transac
   });
 }
 
+function continueListOnEnter(view: EditorView): boolean {
+  const range = view.state.selection.main;
+  if (!range.empty) {
+    return false;
+  }
+  const line = view.state.doc.lineAt(range.head);
+  if (range.head !== line.to) {
+    return false;
+  }
+  const textBeforeCursor = line.text;
+  const bulletMatch = /^(\s*)([-*+])\s+(.*)$/.exec(textBeforeCursor);
+  const numberedMatch = /^(\s*)(\d+)\.\s+(.*)$/.exec(textBeforeCursor);
+  const match = bulletMatch ?? numberedMatch;
+  if (!match) {
+    return false;
+  }
+
+  const [, indent, marker, body] = match;
+  if (!workspace.autoContinueLists) {
+    view.dispatch({
+      changes: { from: range.head, insert: "\n" },
+      selection: { anchor: range.head + 1 },
+      userEvent: "input"
+    });
+    return true;
+  }
+
+  if (body.trim().length === 0) {
+    view.dispatch({
+      changes: { from: line.from, to: line.to, insert: "" },
+      selection: { anchor: line.from },
+      userEvent: "input"
+    });
+    return true;
+  }
+
+  const nextMarker = numberedMatch ? `${Number(marker) + 1}.` : marker;
+  view.dispatch({
+    changes: { from: range.head, insert: `\n${indent}${nextMarker} ` },
+    selection: { anchor: range.head + indent.length + nextMarker.length + 2 },
+    userEvent: "input"
+  });
+  return true;
+}
+
 function createEditorState(pane: EditorPaneState, content: string): EditorState {
   return EditorState.create({
     doc: content,
@@ -993,6 +1097,9 @@ function createEditorState(pane: EditorPaneState, content: string): EditorState 
           pane.stateCache.set(key, update.state);
         }
         if (!update.docChanged || pane.programmaticChange || !pane.activeTabId) {
+          if (update.selectionSet && pane.id === activePaneId) {
+            updateStatusLine();
+          }
           return;
         }
         setActivePane(pane.id);
@@ -1008,6 +1115,11 @@ function createEditorState(pane: EditorPaneState, content: string): EditorState 
         updateStatus();
         scheduleSave(updated.id);
       }),
+      Prec.highest(
+        keymap.of([
+          { key: "Enter", run: continueListOnEnter }
+        ])
+      ),
       keymap.of([
         { key: "Mod-h", run: openSearchPanel },
         indentWithTab,
@@ -1084,6 +1196,67 @@ function updateMinimap(): void {
     .join("\n");
 }
 
+function countDisplayCharacters(content: string): number {
+  const segmenter = typeof Intl !== "undefined" && "Segmenter" in Intl ? new Intl.Segmenter(workspace.locale === "jp" ? "ja" : "en", { granularity: "grapheme" }) : null;
+  return segmenter ? [...segmenter.segment(content)].length : Array.from(content).length;
+}
+
+function cachedCharacterCount(content: string): number {
+  if (content !== statusContentCache) {
+    statusContentCache = content;
+    statusCharacterCountCache = countDisplayCharacters(content);
+  }
+  return statusCharacterCountCache;
+}
+
+function selectionCharacterCount(view: EditorView | null): number {
+  if (!view) {
+    return 0;
+  }
+  let total = 0;
+  view.state.selection.ranges.forEach((range) => {
+    if (!range.empty) {
+      total += countDisplayCharacters(view.state.sliceDoc(range.from, range.to));
+    }
+  });
+  return total;
+}
+
+function cursorLineColumn(view: EditorView | null): { line: number; column: number } {
+  if (!view) {
+    return { line: 1, column: 1 };
+  }
+  const head = view.state.selection.main.head;
+  const line = view.state.doc.lineAt(head);
+  return {
+    line: line.number,
+    column: head - line.from + 1
+  };
+}
+
+function updateStatusLine(tab: TabDocument | null = activeDocument()): void {
+  const label = text();
+  if (!tab) {
+    statusLeft.textContent = saveState.textContent || label.saved;
+    statusRight.textContent = "";
+    return;
+  }
+
+  const child = childTabForPane(tab, activePane());
+  const characterCount = cachedCharacterCount(child.content);
+  const selectedCount = selectionCharacterCount(activePane().view);
+  const position = cursorLineColumn(activePane().view);
+  statusLeft.textContent = [
+    saveState.textContent || label.saved,
+    `${characterCount.toLocaleString()} ${label.characters}`,
+    selectedCount > 0 ? label.selectedCharacters(selectedCount) : "",
+    label.lineColumn(position.line, position.column)
+  ]
+    .filter(Boolean)
+    .join("    ");
+  statusRight.textContent = `${label.data}: ${dataRoot}    ${workspace.theme === "dark" ? label.dark : label.light} / ${workspace.fontSize}px`;
+}
+
 function updateStatus(): void {
   const tab = activeDocument();
   const label = text();
@@ -1093,8 +1266,7 @@ function updateStatus(): void {
     activeTitleInput.value = label.noOpenTab;
     activeTitleInput.disabled = true;
     activeMeta.textContent = "";
-    statusLeft.textContent = `${label.data}: ${dataRoot}`;
-    statusRight.textContent = "";
+    updateStatusLine(null);
     return;
   }
 
@@ -1105,8 +1277,7 @@ function updateStatus(): void {
   }
   activeTitleInput.disabled = false;
   activeMeta.textContent = `${tab.id} > ${child.title} / ${lineCount} ${label.lines} / ${countWords(child.content)} ${label.words}`;
-  statusLeft.textContent = `${label.data}: ${dataRoot}`;
-  statusRight.textContent = `${workspace.theme === "dark" ? label.dark : label.light} / ${workspace.fontSize}px`;
+  updateStatusLine(tab);
 }
 
 function isExpanded(id: string): boolean {
@@ -1225,7 +1396,7 @@ function renderSidebar(): void {
 
 function renderTabRows(tabIds: string[], groupId: string | null): string {
   const opened = new Set(workspace.openedTabIds);
-  return tabIds
+  return orderTabIdsByPinned(tabIds)
     .filter((id) => opened.has(id))
     .map((id) => tabMeta(id))
     .filter((tab): tab is TabMeta => Boolean(tab))
@@ -1233,7 +1404,7 @@ function renderTabRows(tabIds: string[], groupId: string | null): string {
       (tab) => `
         <div class="tab-row ${tab.id === activeTabId ? "is-active" : ""}" data-id="${tab.id}" data-group-id="${groupId ?? UNGROUPED_GROUP_ID}" draggable="true">
           <button type="button" class="tab-title" data-action="activate-tab" data-id="${tab.id}">
-            <span>${escapeHtml(tab.title)}</span>
+            <span>${tab.pinned ? `<span class="pin-mark" aria-hidden="true">●</span>` : ""}${escapeHtml(tab.title)}</span>
             <small>${tab.wordCount} ${text().words}</small>
           </button>
         </div>
@@ -1594,11 +1765,13 @@ function showContextMenu(tabId: string, x: number, y: number): void {
   closeContextMenu();
   const label = text();
   const inGroup = Boolean(groupForTab(tabId));
+  const pinned = isTabPinned(tabId);
   const menu = document.createElement("div");
   menu.className = "context-menu";
   menu.innerHTML = `
     <button type="button" data-action="open-tab-main" data-id="${tabId}">${label.openInMain}</button>
     <button type="button" data-action="open-tab-sub" data-id="${tabId}">${label.openInSub}</button>
+    <button type="button" data-action="toggle-pin-tab" data-id="${tabId}">${pinned ? label.unpinTab : label.pinTab}</button>
     <button type="button" data-action="rename-tab" data-id="${tabId}">${label.rename}</button>
     <button type="button" data-action="duplicate-tab" data-id="${tabId}">${label.duplicate}</button>
     <button type="button" data-action="close-tab" data-id="${tabId}">${label.close}</button>
@@ -1714,6 +1887,10 @@ function openSettingsDialog(): void {
           .join("")}
       </div>
       <button type="button" class="secondary-button" data-settings-action="edit-custom" ${selected === "custom" ? "" : "hidden"}>${escapeHtml(label.editCustomTemplate)}</button>
+      <label class="settings-check">
+        <input type="checkbox" name="auto-continue-lists" ${workspace.autoContinueLists ? "checked" : ""} />
+        <span>${escapeHtml(label.autoContinueLists)}</span>
+      </label>
       <div class="dialog-actions">
         <button type="button" data-dialog-action="cancel">${label.cancel}</button>
         <button type="submit" data-dialog-action="ok">${label.ok}</button>
@@ -1741,6 +1918,7 @@ function openSettingsDialog(): void {
     event.preventDefault();
     const value = new FormData(event.currentTarget as HTMLFormElement).get("new-tab-template");
     workspace.newTabTemplate = value === "novel" || value === "reference" || value === "custom" ? value : "simple";
+    workspace.autoContinueLists = Boolean((event.currentTarget as HTMLFormElement).querySelector<HTMLInputElement>('input[name="auto-continue-lists"]')?.checked);
     workspace.templates = {
       ...workspace.templates,
       custom: [MAIN_CHILD_TAB_TITLE, ...normalizeTemplateTitles(workspace.templates?.custom).slice(1)]
@@ -2366,12 +2544,39 @@ async function renameTab(id: string): Promise<void> {
   await applyTabTitle(id, nextTitle);
 }
 
+function uniqueDuplicateTitle(sourceTitle: string): string {
+  const suffix = workspace.locale === "jp" ? "コピー" : "Copy";
+  const base = `${sourceTitle} - ${suffix}`;
+  const titles = new Set(tabIndex.tabs.map((tab) => tab.title));
+  if (!titles.has(base)) {
+    return base;
+  }
+  let index = 2;
+  while (titles.has(`${base} ${index}`)) {
+    index += 1;
+  }
+  return `${base} ${index}`;
+}
+
+async function togglePinTab(id: string): Promise<void> {
+  const current = isTabPinned(id);
+  tabIndex = normalizePinnedOrderInIndex({
+    ...tabIndex,
+    tabs: tabIndex.tabs.map((tab) => (tab.id === id ? { ...tab, pinned: !current } : tab))
+  });
+  workspace.openedTabIds = flattenedOpenedTabIds();
+  await saveTabsIndex();
+  await saveWorkspace();
+  renderSidebar();
+  setSaveState(current ? text().tabUnpinned : text().tabPinned);
+}
+
 async function duplicateTab(id: string): Promise<void> {
   await flushSave();
   const source = await loadTabToCache(id);
   const newId = nextTabId();
   const updatedAt = nowIso();
-  const title = `${source.title} ${workspace.locale === "jp" ? "コピー" : "Copy"}`;
+  const title = uniqueDuplicateTitle(source.title);
   const childTabs = getChildTabs(source).map((child) => ({
     ...child,
     updatedAt
@@ -2389,6 +2594,10 @@ async function duplicateTab(id: string): Promise<void> {
 
   contentCache.set(newId, duplicated);
   updateMetaFromDocument(duplicated);
+  tabIndex = normalizeTabsIndex({
+    ...tabIndex,
+    tabs: tabIndex.tabs.map((tab) => (tab.id === newId ? { ...tab, pinned: false } : tab))
+  });
   tabIndex = insertTabIntoIndexGroup(tabIndex, newId, sourceGroupId, id, "after");
   selectedGroupId = sourceGroupId;
   workspace.openedTabIds = Array.from(new Set([...workspace.openedTabIds, newId]));
@@ -2404,6 +2613,10 @@ async function duplicateTab(id: string): Promise<void> {
   const saved = ensureTab(await window.textEditor.saveTab(duplicated));
   contentCache.set(newId, saved);
   updateMetaFromDocument(saved);
+  tabIndex = normalizeTabsIndex({
+    ...tabIndex,
+    tabs: tabIndex.tabs.map((tab) => (tab.id === newId ? { ...tab, pinned: false } : tab))
+  });
   tabIndex = insertTabIntoIndexGroup(tabIndex, newId, sourceGroupId, id, "after");
   workspace.openedTabIds = flattenedOpenedTabIds();
   await saveTabsIndex();
@@ -2776,6 +2989,7 @@ async function performAction(
     await activateTab(id);
   } else if (action === "close-tab" && id) await closeTab(id);
   else if (action === "rename-tab" && id) await renameTab(id);
+  else if (action === "toggle-pin-tab" && id) await togglePinTab(id);
   else if (action === "duplicate-tab" && id) await duplicateTab(id);
   else if (action === "ungroup-tab" && id) await ungroupTab(id);
   else if (action === "delete-tab" && id) await deleteTab(id);
