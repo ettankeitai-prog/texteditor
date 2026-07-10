@@ -813,6 +813,15 @@ body.is-split-resizing {
   font-size: 11px;
 }
 
+.backup-history-row {
+  gap: 4px;
+}
+
+.backup-history-row .secondary-button {
+  align-self: flex-start;
+  margin-top: 2px;
+}
+
 .context-menu {
   position: fixed;
   z-index: 30;

@@ -1,8 +1,8 @@
 import AdmZip from "adm-zip";
 import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu } from "electron";
 import type { OpenDialogOptions } from "electron";
-import { existsSync } from "node:fs";
-import { cp, mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { cp, mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import {
   AppStateSnapshot,
@@ -12,6 +12,7 @@ import {
   Locale,
   MAIN_CHILD_TAB_TITLE,
   NewTabTemplateId,
+  RecoveryState,
   TabDocument,
   TabsIndex,
   WorkspaceArchiveVersion,
@@ -61,6 +62,7 @@ type MenuAction =
 app.setName("texteditor");
 
 let currentLocale: Locale = "en";
+let startupRecoveryState: RecoveryState = { abnormalShutdown: false };
 
 const menuLabels: Record<
   Locale,
@@ -178,6 +180,10 @@ function workspacePath(): string {
   return path.join(dataRoot(), "workspace.json");
 }
 
+function sessionPath(): string {
+  return path.join(dataRoot(), "session.json");
+}
+
 function tabsRoot(): string {
   return path.join(dataRoot(), "tabs");
 }
@@ -240,6 +246,53 @@ async function ensureDataFiles(): Promise<void> {
   }
   if (!existsSync(tabsIndexPath())) {
     await writeJson(tabsIndexPath(), emptyTabsIndex);
+  }
+}
+
+function normalizeRecoveryState(input: Partial<RecoveryState> | null): RecoveryState {
+  return {
+    abnormalShutdown: Boolean(input?.abnormalShutdown),
+    startedAt: typeof input?.startedAt === "string" ? input.startedAt : undefined,
+    lastShutdownAt: typeof input?.lastShutdownAt === "string" ? input.lastShutdownAt : undefined
+  };
+}
+
+async function loadRecoveryState(): Promise<RecoveryState> {
+  return normalizeRecoveryState(await readJson<Partial<RecoveryState> | null>(sessionPath(), null));
+}
+
+async function markSessionStarted(): Promise<RecoveryState> {
+  const previous = await loadRecoveryState();
+  const recovery: RecoveryState = {
+    abnormalShutdown: previous.abnormalShutdown,
+    startedAt: previous.startedAt,
+    lastShutdownAt: previous.lastShutdownAt
+  };
+  await writeJson(sessionPath(), {
+    abnormalShutdown: true,
+    startedAt: new Date().toISOString(),
+    lastShutdownAt: previous.lastShutdownAt
+  });
+  return recovery;
+}
+
+function markSessionCleanSync(): void {
+  try {
+    mkdirSync(dataRoot(), { recursive: true });
+    writeFileSync(
+      sessionPath(),
+      `${JSON.stringify(
+        {
+          abnormalShutdown: false,
+          lastShutdownAt: new Date().toISOString()
+        },
+        null,
+        2
+      )}\n`,
+      "utf8"
+    );
+  } catch (error) {
+    console.error("Failed to mark clean shutdown:", error);
   }
 }
 
@@ -421,30 +474,101 @@ async function createBackup(tab: TabDocument, options: { force?: boolean } = {})
   await pruneBackups(normalizedTab.id);
 
   return {
+    tabId: normalizedTab.id,
     fileName,
     createdAt: normalizedTab.updatedAt,
     title: normalizedTab.title,
-    wordCount: countWords(getMainChildTab(normalizedTab).content)
+    wordCount: countWords(getMainChildTab(normalizedTab).content),
+    size: Buffer.byteLength(JSON.stringify(normalizedTab), "utf8"),
+    preview: previewBackupContent(normalizedTab),
+    readable: true
   };
+}
+
+function previewBackupContent(tab: TabDocument): string {
+  const main = getMainChildTab(normalizeTabDocument(tab));
+  return main.content
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .join(" ")
+    .slice(0, 120);
+}
+
+async function backupMetaFromFile(id: string, fileName: string): Promise<BackupMeta | null> {
+  try {
+    const filePath = backupPath(id, fileName);
+    const stats = await stat(filePath);
+    const rawTab = await readJson<TabDocument | null>(filePath, null);
+    if (!rawTab) {
+      return {
+        tabId: id,
+        fileName,
+        createdAt: fileName,
+        title: id,
+        wordCount: 0,
+        size: stats.size,
+        preview: "",
+        readable: false,
+        error: "Unreadable backup"
+      };
+    }
+    const tab = normalizeTabDocument(rawTab);
+    return {
+      tabId: id,
+      fileName,
+      createdAt: tab.updatedAt,
+      title: tab.title,
+      wordCount: countWords(getMainChildTab(tab).content),
+      size: stats.size,
+      preview: previewBackupContent(tab),
+      readable: true
+    };
+  } catch (error) {
+    return {
+      tabId: id,
+      fileName,
+      createdAt: fileName,
+      title: id,
+      wordCount: 0,
+      readable: false,
+      error: error instanceof Error ? error.message : String(error)
+    };
+  }
 }
 
 async function listBackups(id: string): Promise<BackupMeta[]> {
   const files = await listBackupFiles(id);
   const items = await Promise.all(
-    files.map(async (fileName) => {
-      const rawTab = await readJson<TabDocument | null>(backupPath(id, fileName), null);
-      const tab = rawTab ? normalizeTabDocument(rawTab) : null;
-      return tab
-        ? {
-            fileName,
-            createdAt: tab.updatedAt,
-            title: tab.title,
-            wordCount: countWords(getMainChildTab(tab).content)
-          }
-        : null;
-    })
+    files.map((fileName) => backupMetaFromFile(id, fileName))
   );
   return items.filter((item): item is BackupMeta => item !== null).reverse();
+}
+
+async function listBackupHistory(): Promise<BackupMeta[]> {
+  let tabDirs: string[] = [];
+  try {
+    tabDirs = (await readdir(backupsRoot(), { withFileTypes: true }))
+      .filter((entry) => entry.isDirectory() && /^tab-[A-Za-z0-9_-]+$/.test(entry.name))
+      .map((entry) => entry.name);
+  } catch {
+    return [];
+  }
+
+  const allItems = (
+    await Promise.all(
+      tabDirs.map(async (id) => {
+        const files = await listBackupFiles(id);
+        const recentFiles = files.slice(-30);
+        const items = await Promise.all(recentFiles.map((fileName) => backupMetaFromFile(id, fileName)));
+        return items.filter((item): item is BackupMeta => item !== null);
+      })
+    )
+  ).flat();
+
+  return allItems
+    .sort((left, right) => `${right.fileName}`.localeCompare(`${left.fileName}`))
+    .slice(0, 120);
 }
 
 async function createStartupBackups(workspace: WorkspaceState, index: TabsIndex): Promise<void> {
@@ -662,8 +786,23 @@ ipcMain.handle("app:load", async (): Promise<AppStateSnapshot> => {
   return {
     workspace,
     tabIndex,
-    dataRoot: dataRoot()
+    dataRoot: dataRoot(),
+    recovery: startupRecoveryState
   };
+});
+
+ipcMain.handle("app:recovery:ack", async (_event, restore: boolean): Promise<void> => {
+  startupRecoveryState = { ...startupRecoveryState, abnormalShutdown: false };
+  await writeJson(sessionPath(), {
+    abnormalShutdown: true,
+    startedAt: new Date().toISOString(),
+    lastShutdownAt: startupRecoveryState.lastShutdownAt,
+    recoveryChoice: restore ? "restore" : "skip"
+  });
+});
+
+ipcMain.handle("app:quit", async (): Promise<void> => {
+  app.quit();
 });
 
 ipcMain.handle("workspace:save", async (_event, workspace: WorkspaceState): Promise<WorkspaceState> => {
@@ -768,6 +907,10 @@ ipcMain.handle("tab:backup:create", async (_event, tab: TabDocument): Promise<Ba
 ipcMain.handle("tab:backup:list", async (_event, id: string): Promise<BackupMeta[]> => {
   assertTabId(id);
   return listBackups(id);
+});
+
+ipcMain.handle("tab:backup:listAll", async (): Promise<BackupMeta[]> => {
+  return listBackupHistory();
 });
 
 ipcMain.handle("tab:backup:load", async (_event, id: string, fileName: string): Promise<TabDocument> => {
@@ -982,6 +1125,7 @@ ipcMain.handle("clipboard:writeText", async (_event, text: string): Promise<void
 
 app.whenReady().then(async () => {
   await ensureDataFiles();
+  startupRecoveryState = await markSessionStarted();
   currentLocale = (await loadWorkspace()).locale;
   Menu.setApplicationMenu(buildApplicationMenu());
   createWindow();
@@ -990,6 +1134,10 @@ app.whenReady().then(async () => {
       createWindow();
     }
   });
+});
+
+app.on("will-quit", () => {
+  markSessionCleanSync();
 });
 
 app.on("window-all-closed", () => {

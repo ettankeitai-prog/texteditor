@@ -593,7 +593,7 @@ test.describe("Text Editor Electron MVP", () => {
     }
   });
 
-  test("lists and restores backups for the active tab", async ({}, testInfo) => {
+  test("lists backup history and restores a backup as a new tab", async ({}, testInfo) => {
     const { app, page, dataDir } = await launchTextEditor(testInfo);
     try {
       const id = await activeTabId(page);
@@ -615,13 +615,60 @@ test.describe("Text Editor Electron MVP", () => {
       await waitForSavedTab(dataDir, id, "changed content");
 
       await pressShortcut(page, "Control+Shift+B");
-      await page.locator(".list-row", { hasText: "Backup Target" }).first().click();
-      await page.getByRole("button", { name: "Restore" }).click();
+      await expect(page.locator(".backup-history-row", { hasText: "Backup Target" })).toBeVisible();
+      await expect(page.locator(".backup-history-row", { hasText: "original content" })).toBeVisible();
+      await page.locator(".backup-history-row", { hasText: "Backup Target" }).getByRole("button", { name: "Restore as New Tab" }).click();
+      await page.locator("form").getByRole("button", { name: "Restore as New Tab" }).click();
 
-      await expect.poll(async () => (await readTab(dataDir, id)).content).toBe("original content");
+      await expect.poll(async () => (await readTab(dataDir, id)).content).toBe("changed content");
+      await expect(page.locator("#active-title-input")).toHaveValue("Backup Target - Restored");
       await expect(page.locator("#left-editor-host .cm-content")).toContainText("original content");
+      await expect.poll(async () => (await readIndex(dataDir)).tabs.some((tab) => tab.title === "Backup Target - Restored")).toBe(true);
     } finally {
       await closeApp(app);
+    }
+  });
+
+  test("asks before restoring after an abnormal shutdown marker", async ({}, testInfo) => {
+    const first = await launchTextEditor(testInfo);
+    try {
+      await first.page.locator("#active-title-input").fill("Crash Tab");
+      await first.page.locator("#active-title-input").press("Enter");
+      await replaceEditorText(first.page, "draft before crash");
+      await waitForSavedTab(first.dataDir, await activeTabId(first.page), "draft before crash");
+    } finally {
+      await closeApp(first.app);
+    }
+
+    await writeFile(
+      path.join(first.dataDir, "session.json"),
+      `${JSON.stringify({ abnormalShutdown: true, startedAt: new Date().toISOString() }, null, 2)}\n`,
+      "utf8"
+    );
+
+    const restored = await launchTextEditor(testInfo, { clean: false, userDataDir: first.userDataDir });
+    try {
+      await expect(restored.page.getByText("The app did not shut down normally last time.")).toBeVisible();
+      await restored.page.getByRole("button", { name: "Restore" }).click();
+      await expect(restored.page.locator("#active-title-input")).toHaveValue("Crash Tab");
+      await expect(restored.page.locator("#left-editor-host .cm-content")).toContainText("draft before crash");
+    } finally {
+      await closeApp(restored.app);
+    }
+
+    await writeFile(
+      path.join(first.dataDir, "session.json"),
+      `${JSON.stringify({ abnormalShutdown: true, startedAt: new Date().toISOString() }, null, 2)}\n`,
+      "utf8"
+    );
+
+    const skipped = await launchTextEditor(testInfo, { clean: false, userDataDir: first.userDataDir });
+    try {
+      await skipped.page.getByRole("button", { name: "Start without restoring" }).click();
+      await expect(skipped.page.locator("#active-title-input")).toHaveValue("No open tab");
+      await expect.poll(async () => (await readTab(first.dataDir, (await readIndex(first.dataDir)).tabs[0].id)).content).toBe("draft before crash");
+    } finally {
+      await closeApp(skipped.app);
     }
   });
 

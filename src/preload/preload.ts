@@ -49,7 +49,10 @@ const api = {
   deleteTab: (id: string): Promise<TabsIndex> => ipcRenderer.invoke("tab:delete", id),
   createBackup: (tab: TabDocument): Promise<BackupMeta | null> => ipcRenderer.invoke("tab:backup:create", tab),
   listBackups: (id: string): Promise<BackupMeta[]> => ipcRenderer.invoke("tab:backup:list", id),
+  listBackupHistory: (): Promise<BackupMeta[]> => ipcRenderer.invoke("tab:backup:listAll"),
   loadBackup: (id: string, fileName: string): Promise<TabDocument> => ipcRenderer.invoke("tab:backup:load", id, fileName),
+  acknowledgeRecovery: (restore: boolean): Promise<void> => ipcRenderer.invoke("app:recovery:ack", restore),
+  quitApp: (): Promise<void> => ipcRenderer.invoke("app:quit"),
   exportTxt: (tab: TabDocument): Promise<{ canceled: boolean; filePath?: string }> =>
     ipcRenderer.invoke("tab:exportTxt", tab),
   exportAllTxt: (): Promise<{ canceled: boolean; filePath?: string }> => ipcRenderer.invoke("tabs:exportAllTxt"),

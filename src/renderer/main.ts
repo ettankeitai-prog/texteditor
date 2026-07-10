@@ -263,9 +263,18 @@ type UiText = {
   autoContinueLists: string;
   templateSaved: string;
   recentClosed: string;
+  backupHistory: string;
   restoreBackup: string;
+  restoreAsNewTab: string;
   noBackups: string;
-  restoreConfirm: string;
+  restoreConfirm: (title: string) => string;
+  backupPreview: string;
+  backupUnreadable: string;
+  restoredTabSuffix: string;
+  recoveryTitle: string;
+  recoveryMessage: string;
+  recoverPreviousSession: string;
+  skipRecovery: string;
   deleteConfirm: (title: string) => string;
   globalSearch: string;
   closeSearch: string;
@@ -367,9 +376,18 @@ const uiText: Record<Locale, UiText> = {
     autoContinueLists: "Continue lists automatically",
     templateSaved: "Template saved",
     recentClosed: "Recent / Closed",
+    backupHistory: "Backup History",
     restoreBackup: "Restore Backup",
+    restoreAsNewTab: "Restore as New Tab",
     noBackups: "No backups",
-    restoreConfirm: "Restore this backup and overwrite the current tab content?",
+    restoreConfirm: (title) => `Restore "${title}" as a new tab?`,
+    backupPreview: "Preview",
+    backupUnreadable: "Unreadable backup",
+    restoredTabSuffix: "Restored",
+    recoveryTitle: "Restore previous session?",
+    recoveryMessage: "The app did not shut down normally last time. Restore the previous editing session?",
+    recoverPreviousSession: "Restore",
+    skipRecovery: "Start without restoring",
     deleteConfirm: (title) => `Completely delete "${title}"? This removes the JSON file after creating a final backup.`,
     globalSearch: "Search",
     closeSearch: "Close search",
@@ -469,9 +487,18 @@ const uiText: Record<Locale, UiText> = {
     autoContinueLists: "箇条書きを自動継続",
     templateSaved: "テンプレートを保存しました",
     recentClosed: "最近閉じたタブ",
+    backupHistory: "バックアップ履歴",
     restoreBackup: "バックアップから復元",
+    restoreAsNewTab: "新規タブとして復元",
     noBackups: "バックアップはありません",
-    restoreConfirm: "このバックアップで現在のタブ内容を上書きして復元しますか？",
+    restoreConfirm: (title) => `「${title}」を新規タブとして復元しますか？`,
+    backupPreview: "プレビュー",
+    backupUnreadable: "読み込めないバックアップ",
+    restoredTabSuffix: "復元",
+    recoveryTitle: "前回の編集状態を復元しますか？",
+    recoveryMessage: "前回、アプリが正常に終了しませんでした。前回の編集状態を復元しますか？",
+    recoverPreviousSession: "復元する",
+    skipRecovery: "復元せず起動",
     deleteConfirm: (title) => `「${title}」を完全削除しますか？ 最終バックアップを作成してから JSON ファイルを削除します。`,
     globalSearch: "検索",
     closeSearch: "検索を閉じる",
@@ -1748,6 +1775,42 @@ function confirmDialog(message: string, confirmLabel = text().ok): Promise<boole
   });
 }
 
+function recoveryDialog(): Promise<"restore" | "skip" | "cancel"> {
+  return new Promise((resolve) => {
+    const label = text();
+    const overlay = document.createElement("div");
+    overlay.className = "dialog-overlay";
+    overlay.innerHTML = `
+      <form class="app-dialog">
+        <div class="dialog-title">${escapeHtml(label.recoveryTitle)}</div>
+        <p class="dialog-note">${escapeHtml(label.recoveryMessage)}</p>
+        <div class="dialog-actions">
+          <button type="button" data-recovery-action="cancel">${label.cancel}</button>
+          <button type="button" data-recovery-action="skip">${escapeHtml(label.skipRecovery)}</button>
+          <button type="submit" data-recovery-action="restore">${escapeHtml(label.recoverPreviousSession)}</button>
+        </div>
+      </form>
+    `;
+
+    overlay.querySelector<HTMLButtonElement>('[data-recovery-action="cancel"]')!.addEventListener("click", () => {
+      overlay.remove();
+      resolve("cancel");
+    });
+    overlay.querySelector<HTMLButtonElement>('[data-recovery-action="skip"]')!.addEventListener("click", () => {
+      overlay.remove();
+      resolve("skip");
+    });
+    overlay.querySelector<HTMLFormElement>("form")!.addEventListener("submit", (event) => {
+      event.preventDefault();
+      overlay.remove();
+      resolve("restore");
+    });
+
+    document.body.appendChild(overlay);
+    overlay.querySelector<HTMLButtonElement>('[data-recovery-action="restore"]')!.focus();
+  });
+}
+
 function closeContextMenu(): void {
   document.querySelector(".context-menu")?.remove();
 }
@@ -2053,16 +2116,11 @@ function showRecentDialog(): void {
 }
 
 async function showBackupsDialog(): Promise<void> {
-  const tab = activeDocument();
   const label = text();
-  if (!tab) {
-    setSaveState(label.noActiveTab, "error");
-    return;
-  }
 
   let backups: BackupMeta[] = [];
   try {
-    backups = await window.textEditor.listBackups(tab.id);
+    backups = await window.textEditor.listBackupHistory();
   } catch (error) {
     setSaveState(`${label.backupListFailed}: ${errorMessage(error)}`, "error");
     return;
@@ -2072,21 +2130,37 @@ async function showBackupsDialog(): Promise<void> {
     ? backups
         .map(
           (backup) => `
-            <button type="button" class="list-row" data-action="restore-backup" data-id="${tab.id}" data-file="${backup.fileName}">
-              <span>${escapeHtml(formatBackupLabel(backup))}</span>
-              <small>${backup.wordCount} ${label.words} / ${escapeHtml(backup.title)}</small>
-            </button>
+            <div class="list-row backup-history-row">
+              <span>${escapeHtml(formatBackupLabel(backup))} / ${escapeHtml(backup.title)}</span>
+              <small>${backup.wordCount} ${label.words} / ${formatBytes(backup.size ?? 0)}${backup.tabId ? ` / ${escapeHtml(backup.tabId)}` : ""}</small>
+              <small>${backup.readable === false ? escapeHtml(backup.error || label.backupUnreadable) : `${escapeHtml(label.backupPreview)}: ${escapeHtml(backup.preview || label.empty)}`}</small>
+              ${
+                backup.readable === false || !backup.tabId
+                  ? ""
+                  : `<button type="button" class="secondary-button" data-action="restore-backup-as-tab" data-id="${backup.tabId}" data-file="${backup.fileName}">${escapeHtml(label.restoreAsNewTab)}</button>`
+              }
+            </div>
           `
         )
         .join("")
     : `<div class="empty-list">${label.noBackups}</div>`;
 
-  modalBase(label.restoreBackup, `<div class="modal-list">${rows}</div>`);
+  modalBase(label.backupHistory, `<div class="modal-list">${rows}</div>`);
 }
 
 function formatBackupLabel(backup: BackupMeta): string {
   const match = /^(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})/.exec(backup.fileName);
   return match ? `${match[1]}-${match[2]}-${match[3]} ${match[4]}:${match[5]}:${match[6]}` : backup.fileName;
+}
+
+function formatBytes(size: number): string {
+  if (size < 1024) {
+    return `${size} B`;
+  }
+  if (size < 1024 * 1024) {
+    return `${(size / 1024).toFixed(1)} KB`;
+  }
+  return `${(size / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 async function restoreBackup(tabId: string, fileName: string): Promise<void> {
@@ -2095,7 +2169,7 @@ async function restoreBackup(tabId: string, fileName: string): Promise<void> {
     await activateTab(tabId);
   }
 
-  if (!(await confirmDialog(text().restoreConfirm, text().restore))) {
+  if (!(await confirmDialog(text().restoreConfirm(current?.title ?? tabId), text().restore))) {
     return;
   }
 
@@ -2115,6 +2189,65 @@ async function restoreBackup(tabId: string, fileName: string): Promise<void> {
   contentCache.set(tabId, saved);
   updateMetaFromDocument(saved);
   syncPaneViewsForTab(tabId);
+  renderSidebar();
+  updateStatus();
+  setSaveState(text().backupRestored);
+}
+
+async function restoreBackupAsNewTab(tabId: string, fileName: string): Promise<void> {
+  const backup = await window.textEditor.loadBackup(tabId, fileName);
+  const restoredTitle = uniqueRestoredTitle(backup.title.trim() || text().untitled);
+  if (!(await confirmDialog(text().restoreConfirm(restoredTitle), text().restoreAsNewTab))) {
+    return;
+  }
+
+  const newId = nextTabId();
+  const updatedAt = nowIso();
+  const sourceGroupId = tabGroupId(tabId);
+  const restored = ensureTab({
+    ...backup,
+    id: newId,
+    title: restoredTitle,
+    activeChildTabId: backup.activeChildTabId ?? MAIN_CHILD_TAB_ID,
+    childTabs: getChildTabs(backup).map((child) => ({
+      ...child,
+      updatedAt
+    })),
+    content: getMainChildTab(backup).content,
+    updatedAt
+  });
+
+  contentCache.set(newId, restored);
+  updateMetaFromDocument(restored);
+  tabIndex = normalizeTabsIndex({
+    ...tabIndex,
+    tabs: tabIndex.tabs.map((tab) => (tab.id === newId ? { ...tab, pinned: false } : tab))
+  });
+  expandTargetGroup(sourceGroupId);
+  tabIndex = insertTabIntoIndexGroup(tabIndex, newId, sourceGroupId, tabMeta(tabId) ? tabId : undefined, tabMeta(tabId) ? "after" : "end");
+  selectedGroupId = sourceGroupId;
+  workspace.openedTabIds = Array.from(new Set([...workspace.openedTabIds, newId]));
+  workspace.openedTabIds = flattenedOpenedTabIds();
+  workspace.recentTabIds = [newId, ...workspace.recentTabIds.filter((entry) => entry !== newId)].slice(0, 20);
+  cachePaneEditorState(activePane());
+  activePane().activeTabId = newId;
+  activePane().activeChildTabId = restored.activeChildTabId ?? MAIN_CHILD_TAB_ID;
+  syncActiveTabId();
+  setPaneEditorContent(activePane(), childTabForPane(restored, activePane()).content);
+  setPaneEditorEnabled(activePane(), true);
+
+  const saved = ensureTab(await window.textEditor.saveTab(restored));
+  contentCache.set(newId, saved);
+  updateMetaFromDocument(saved);
+  tabIndex = normalizeTabsIndex({
+    ...tabIndex,
+    tabs: tabIndex.tabs.map((tab) => (tab.id === newId ? { ...tab, pinned: false } : tab))
+  });
+  tabIndex = insertTabIntoIndexGroup(tabIndex, newId, sourceGroupId, tabMeta(tabId) ? tabId : undefined, tabMeta(tabId) ? "after" : "end");
+  workspace.openedTabIds = flattenedOpenedTabIds();
+  await saveTabsIndex();
+  await saveWorkspace();
+  document.querySelector(".dialog-overlay")?.remove();
   renderSidebar();
   updateStatus();
   setSaveState(text().backupRestored);
@@ -2558,6 +2691,19 @@ function uniqueDuplicateTitle(sourceTitle: string): string {
   return `${base} ${index}`;
 }
 
+function uniqueRestoredTitle(sourceTitle: string): string {
+  const base = `${sourceTitle} - ${text().restoredTabSuffix}`;
+  const titles = new Set(tabIndex.tabs.map((tab) => tab.title));
+  if (!titles.has(base)) {
+    return base;
+  }
+  let index = 2;
+  while (titles.has(`${base} ${index}`)) {
+    index += 1;
+  }
+  return `${base} ${index}`;
+}
+
 async function togglePinTab(id: string): Promise<void> {
   const current = isTabPinned(id);
   tabIndex = normalizePinnedOrderInIndex({
@@ -2795,6 +2941,29 @@ function applyLocale(): void {
   updateGlobalSearchLabels();
 }
 
+function clearRestoredWorkspaceViewState(): void {
+  workspace = {
+    ...workspace,
+    activeTabId: null,
+    openedTabIds: [],
+    layout: {
+      ...workspace.layout,
+      splitMode: "single",
+      activePaneId: "left",
+      panes: [
+        { id: "left", activeTabId: null, activeChildTabId: MAIN_CHILD_TAB_ID },
+        { id: "right", activeTabId: null, activeChildTabId: MAIN_CHILD_TAB_ID }
+      ]
+    }
+  };
+  activePaneId = "left";
+  panes.left.activeTabId = null;
+  panes.left.activeChildTabId = MAIN_CHILD_TAB_ID;
+  panes.right.activeTabId = null;
+  panes.right.activeChildTabId = MAIN_CHILD_TAB_ID;
+  syncActiveTabId();
+}
+
 async function toggleLocale(): Promise<void> {
   workspace.locale = workspace.locale === "jp" ? "en" : "jp";
   await saveWorkspace();
@@ -2996,6 +3165,8 @@ async function performAction(
   else if (action === "restore-backup" && id && fileName) {
     source?.closest(".dialog-overlay")?.remove();
     await restoreBackup(id, fileName);
+  } else if (action === "restore-backup-as-tab" && id && fileName) {
+    await restoreBackupAsNewTab(id, fileName);
   } else if (action === "toggle-section" && id) setExpanded(id, !isExpanded(id));
 }
 
@@ -3315,6 +3486,20 @@ async function bootstrap(): Promise<void> {
   shell.dataset.theme = workspace.theme;
   document.body.dataset.theme = workspace.theme;
   applyLocale();
+
+  if (snapshot.recovery?.abnormalShutdown) {
+    const choice = await recoveryDialog();
+    if (choice === "cancel") {
+      await window.textEditor.quitApp();
+      return;
+    }
+    await window.textEditor.acknowledgeRecovery(choice === "restore");
+    if (choice === "skip") {
+      clearRestoredWorkspaceViewState();
+      await saveWorkspace();
+    }
+  }
+
   applySidebarWidth();
   activePaneId = workspace.layout.activePaneId === "right" && workspace.layout.splitMode === "vertical" ? "right" : "left";
   const savedLeftPane = workspace.layout.panes.find((pane) => pane.id === "left");

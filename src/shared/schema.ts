@@ -78,13 +78,25 @@ export interface AppStateSnapshot {
   workspace: WorkspaceState;
   tabIndex: TabsIndex;
   dataRoot: string;
+  recovery: RecoveryState;
 }
 
 export interface BackupMeta {
+  tabId?: string;
   fileName: string;
   createdAt: string;
   title: string;
   wordCount: number;
+  size?: number;
+  preview?: string;
+  readable?: boolean;
+  error?: string;
+}
+
+export interface RecoveryState {
+  abnormalShutdown: boolean;
+  startedAt?: string;
+  lastShutdownAt?: string;
 }
 
 export interface GlobalSearchResult {
