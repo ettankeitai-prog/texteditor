@@ -93,6 +93,10 @@ async function pressShortcut(page: Page, shortcut: string) {
   await page.keyboard.press(process.platform === "darwin" ? shortcut.replace("Control", "Meta") : shortcut);
 }
 
+async function editorText(page: Page, pane: "left" | "right" = "left") {
+  return page.locator(`#${pane}-editor-host .cm-content`).textContent();
+}
+
 async function createGroupFromSidebarBlank(page: Page) {
   const box = await page.locator("#sidebar").boundingBox();
   if (!box) {
@@ -103,6 +107,190 @@ async function createGroupFromSidebarBlank(page: Page) {
 }
 
 test.describe("Text Editor Electron MVP", () => {
+  test.describe("undo and redo history", () => {
+    test("undoes and redoes basic input", async ({}, testInfo) => {
+      const { app, page } = await launchTextEditor(testInfo);
+      try {
+        await replaceEditorText(page, "abc");
+        await pressShortcut(page, "Control+Z");
+        await expect.poll(() => editorText(page)).toBe("");
+        await pressShortcut(page, "Control+Y");
+        await expect.poll(() => editorText(page)).toBe("abc");
+      } finally {
+        await closeApp(app);
+      }
+    });
+
+    test("keeps undo history isolated when switching tabs", async ({}, testInfo) => {
+      const { app, page, dataDir } = await launchTextEditor(testInfo);
+      try {
+        const firstId = await activeTabId(page);
+        await page.locator("#active-title-input").fill("Tab A");
+        await page.locator("#active-title-input").press("Enter");
+        await replaceEditorText(page, "alpha");
+        await waitForSavedTab(dataDir, firstId, "alpha");
+
+        await pressShortcut(page, "Control+N");
+        await expect(page.locator(".tab-row")).toHaveCount(2);
+        await expect(page.locator("#active-title-input")).toHaveValue("Untitled");
+        const secondId = await activeTabId(page);
+        expect(secondId).not.toBe(firstId);
+        await page.locator("#active-title-input").fill("Tab B");
+        await page.locator("#active-title-input").press("Enter");
+        await replaceEditorText(page, "beta");
+        await waitForSavedTab(dataDir, secondId, "beta");
+
+        await page.locator(`.tab-row[data-id="${firstId}"]`).click();
+        await expect(page.locator("#active-title-input")).toHaveValue("Tab A");
+        await expect(page.locator("#left-editor-host .cm-content")).toBeFocused();
+        await pressShortcut(page, "Control+Z");
+        await expect.poll(() => editorText(page)).toBe("");
+        await expect.poll(async () => (await readTab(dataDir, secondId)).content).toBe("beta");
+
+        await pressShortcut(page, "Control+Y");
+        await expect.poll(() => editorText(page)).toBe("alpha");
+      } finally {
+        await closeApp(app);
+      }
+    });
+
+    test("keeps undo available after autosave", async ({}, testInfo) => {
+      const { app, page, dataDir } = await launchTextEditor(testInfo);
+      try {
+        const id = await activeTabId(page);
+        await replaceEditorText(page, "autosaved text");
+        await waitForSavedTab(dataDir, id, "autosaved text");
+        await expect(page.locator("#save-state")).toContainText("Saved");
+        await pressShortcut(page, "Control+Z");
+        await expect.poll(() => editorText(page)).toBe("");
+      } finally {
+        await closeApp(app);
+      }
+    });
+
+    test("undoes Japanese input as one edit", async ({}, testInfo) => {
+      const { app, page } = await launchTextEditor(testInfo);
+      try {
+        await replaceEditorText(page, "日本語の文章");
+        await pressShortcut(page, "Control+Z");
+        await expect.poll(() => editorText(page)).toBe("");
+        await pressShortcut(page, "Control+Y");
+        await expect.poll(() => editorText(page)).toBe("日本語の文章");
+      } finally {
+        await closeApp(app);
+      }
+    });
+
+    test("undoes a multiline paste as one edit", async ({}, testInfo) => {
+      const { app, page } = await launchTextEditor(testInfo);
+      try {
+        await page.evaluate(async () => window.textEditor.writeClipboardText("first\nsecond\nthird"));
+        await focusEditor(page);
+        await pressShortcut(page, "Control+V");
+        await expect(page.locator("#left-editor-host .cm-content")).toContainText("third");
+        await pressShortcut(page, "Control+Z");
+        await expect.poll(() => editorText(page)).toBe("");
+      } finally {
+        await closeApp(app);
+      }
+    });
+
+    test("undoes and redoes replace all", async ({}, testInfo) => {
+      const { app, page } = await launchTextEditor(testInfo);
+      try {
+        await replaceEditorText(page, "cat cat");
+        await pressShortcut(page, "Control+H");
+        const panel = page.locator(".cm-search");
+        await panel.locator('input[name="search"]').fill("cat");
+        await panel.locator('input[name="replace"]').fill("dog");
+        await panel.getByRole("button", { name: /replace all/i }).click();
+        await expect.poll(() => editorText(page)).toBe("dog dog");
+        await page.keyboard.press("Escape");
+        await pressShortcut(page, "Control+Z");
+        await expect.poll(() => editorText(page)).toBe("cat cat");
+        await pressShortcut(page, "Control+Y");
+        await expect.poll(() => editorText(page)).toBe("dog dog");
+      } finally {
+        await closeApp(app);
+      }
+    });
+
+    test("keeps child-tab history isolated", async ({}, testInfo) => {
+      const { app, page } = await launchTextEditor(testInfo);
+      try {
+        await replaceEditorText(page, "main edit");
+        await page.locator("#left-child-tab-bar .child-tab-add").click();
+        await page.locator(".dialog-input").fill("Memo");
+        await page.getByRole("button", { name: "OK" }).click();
+        await replaceEditorText(page, "memo edit");
+
+        await page.locator('#left-child-tab-bar [data-child-id="main"]').click();
+        await focusEditor(page);
+        await pressShortcut(page, "Control+Z");
+        await expect.poll(() => editorText(page)).toBe("");
+
+        await page.locator('#left-child-tab-bar [data-child-id="memo"]').click();
+        await expect.poll(() => editorText(page)).toBe("memo edit");
+      } finally {
+        await closeApp(app);
+      }
+    });
+
+    test("discards redo history after a new edit", async ({}, testInfo) => {
+      const { app, page } = await launchTextEditor(testInfo);
+      try {
+        await replaceEditorText(page, "old");
+        await pressShortcut(page, "Control+Z");
+        await page.keyboard.insertText("new");
+        await pressShortcut(page, "Control+Y");
+        await expect.poll(() => editorText(page)).toBe("new");
+      } finally {
+        await closeApp(app);
+      }
+    });
+
+    test("synchronizes split views through undo and redo", async ({}, testInfo) => {
+      const { app, page } = await launchTextEditor(testInfo);
+      try {
+        await pressShortcut(page, "Control+\\");
+        await expect(page.locator('section[data-pane-id="right"]')).toBeVisible();
+        await pressShortcut(page, "Control+1");
+        await replaceEditorText(page, "shared text");
+        await expect.poll(() => editorText(page, "right")).toBe("shared text");
+
+        await pressShortcut(page, "Control+Z");
+        await expect.poll(() => editorText(page, "left")).toBe("");
+        await expect.poll(() => editorText(page, "right")).toBe("");
+
+        await pressShortcut(page, "Control+Y");
+        await expect.poll(() => editorText(page, "left")).toBe("shared text");
+        await expect.poll(() => editorText(page, "right")).toBe("shared text");
+      } finally {
+        await closeApp(app);
+      }
+    });
+
+    test("does not expose initial document loading as undo history after restart", async ({}, testInfo) => {
+      const first = await launchTextEditor(testInfo);
+      try {
+        const id = await activeTabId(first.page);
+        await replaceEditorText(first.page, "persisted text");
+        await waitForSavedTab(first.dataDir, id, "persisted text");
+      } finally {
+        await closeApp(first.app);
+      }
+
+      const relaunched = await launchTextEditor(testInfo, { clean: false, userDataDir: first.userDataDir });
+      try {
+        await expect.poll(() => editorText(relaunched.page)).toBe("persisted text");
+        await pressShortcut(relaunched.page, "Control+Z");
+        await expect.poll(() => editorText(relaunched.page)).toBe("persisted text");
+      } finally {
+        await closeApp(relaunched.app);
+      }
+    });
+  });
+
   test("autosaves, renames from header, copies plain text, and persists sidebar width", async ({}, testInfo) => {
     const { app, page, userDataDir, dataDir } = await launchTextEditor(testInfo);
     try {

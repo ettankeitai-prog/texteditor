@@ -1,7 +1,7 @@
 import { defaultKeymap, history, historyKeymap, indentWithTab, redo, undo } from "@codemirror/commands";
 import { markdown } from "@codemirror/lang-markdown";
 import { findNext, findPrevious, openSearchPanel, search, searchKeymap } from "@codemirror/search";
-import { Compartment, EditorState } from "@codemirror/state";
+import { Compartment, EditorState, Transaction } from "@codemirror/state";
 import { EditorView, highlightActiveLine, keymap, lineNumbers } from "@codemirror/view";
 import "./styles.css";
 import {
@@ -171,6 +171,7 @@ type EditorPaneState = {
   activeTabId: string | null;
   activeChildTabId: string;
   programmaticChange: boolean;
+  stateCache: Map<string, EditorState>;
   fontSizeCompartment: Compartment;
   themeCompartment: Compartment;
 };
@@ -186,6 +187,7 @@ const panes: Record<PaneId, EditorPaneState> = {
     activeTabId: null,
     activeChildTabId: MAIN_CHILD_TAB_ID,
     programmaticChange: false,
+    stateCache: new Map(),
     fontSizeCompartment: new Compartment(),
     themeCompartment: new Compartment()
   },
@@ -199,6 +201,7 @@ const panes: Record<PaneId, EditorPaneState> = {
     activeTabId: null,
     activeChildTabId: MAIN_CHILD_TAB_ID,
     programmaticChange: false,
+    stateCache: new Map(),
     fontSizeCompartment: new Compartment(),
     themeCompartment: new Compartment()
   }
@@ -832,7 +835,13 @@ async function saveCurrentTabNow(): Promise<void> {
       if (!tab) {
         continue;
       }
+      const savedVersion = tab.updatedAt;
       const saved = ensureTab(await window.textEditor.saveTab(tab));
+      const latest = contentCache.get(id);
+      if (latest && latest.updatedAt !== savedVersion) {
+        updateMetaFromDocument(latest);
+        continue;
+      }
       contentCache.set(saved.id, saved);
       updateMetaFromDocument(saved);
       dirtyTabIds.delete(saved.id);
@@ -933,46 +942,89 @@ function editorTheme(): ReturnType<typeof EditorView.theme> {
   });
 }
 
+function paneDocumentKey(pane: EditorPaneState): string | null {
+  return pane.activeTabId ? `${pane.activeTabId}:${pane.activeChildTabId}` : null;
+}
+
+function cachePaneEditorState(pane: EditorPaneState): void {
+  const key = paneDocumentKey(pane);
+  if (key && pane.view) {
+    pane.stateCache.set(key, pane.view.state);
+  }
+}
+
+function syncEditorTransaction(sourcePane: EditorPaneState, transaction: Transaction): void {
+  const sourceKey = paneDocumentKey(sourcePane);
+  if (!sourceKey || !sourcePane.view) {
+    return;
+  }
+
+  (Object.values(panes) as EditorPaneState[]).forEach((targetPane) => {
+    if (targetPane.id === sourcePane.id || paneDocumentKey(targetPane) !== sourceKey || !targetPane.view) {
+      return;
+    }
+    if (targetPane.view.state.doc.toString() !== transaction.startState.doc.toString()) {
+      setPaneEditorContent(targetPane, sourcePane.view!.state.doc.toString());
+      return;
+    }
+    targetPane.programmaticChange = true;
+    targetPane.view.dispatch({
+      changes: transaction.changes,
+      annotations: Transaction.addToHistory.of(false)
+    });
+    targetPane.programmaticChange = false;
+    cachePaneEditorState(targetPane);
+  });
+}
+
+function createEditorState(pane: EditorPaneState, content: string): EditorState {
+  return EditorState.create({
+    doc: content,
+    extensions: [
+      lineNumbers(),
+      history(),
+      markdown(),
+      search({ top: true }),
+      highlightActiveLine(),
+      EditorView.lineWrapping,
+      EditorView.updateListener.of((update) => {
+        const key = paneDocumentKey(pane);
+        if (key) {
+          pane.stateCache.set(key, update.state);
+        }
+        if (!update.docChanged || pane.programmaticChange || !pane.activeTabId) {
+          return;
+        }
+        setActivePane(pane.id);
+        const current = contentCache.get(pane.activeTabId);
+        if (!current) {
+          return;
+        }
+        const updated = setChildContent(current, pane.activeChildTabId, update.state.doc.toString());
+        contentCache.set(pane.activeTabId, updated);
+        updateMetaFromDocument(updated);
+        update.transactions.forEach((transaction) => syncEditorTransaction(pane, transaction));
+        updateMinimap();
+        updateStatus();
+        scheduleSave(updated.id);
+      }),
+      keymap.of([
+        { key: "Mod-h", run: openSearchPanel },
+        indentWithTab,
+        ...searchKeymap,
+        ...defaultKeymap,
+        ...historyKeymap
+      ]),
+      pane.fontSizeCompartment.of([]),
+      pane.themeCompartment.of(editorTheme())
+    ]
+  });
+}
+
 function createEditor(pane: EditorPaneState): void {
   pane.view = new EditorView({
     parent: pane.host,
-    state: EditorState.create({
-      doc: "",
-      extensions: [
-        lineNumbers(),
-        history(),
-        markdown(),
-        search({ top: true }),
-        highlightActiveLine(),
-        EditorView.lineWrapping,
-        EditorView.updateListener.of((update) => {
-          if (!update.docChanged || pane.programmaticChange || !pane.activeTabId) {
-            return;
-          }
-          setActivePane(pane.id);
-          const current = contentCache.get(pane.activeTabId);
-          if (!current) {
-            return;
-          }
-          const updated = setChildContent(current, pane.activeChildTabId, update.state.doc.toString());
-          contentCache.set(pane.activeTabId, updated);
-          updateMetaFromDocument(updated);
-          syncPaneViewsForTab(updated.id, pane.id, pane.activeChildTabId);
-          updateMinimap();
-          updateStatus();
-          scheduleSave(updated.id);
-        }),
-        keymap.of([
-          { key: "Mod-h", run: openSearchPanel },
-          indentWithTab,
-          ...searchKeymap,
-          ...defaultKeymap,
-          ...historyKeymap
-        ]),
-        pane.fontSizeCompartment.of([]),
-        pane.themeCompartment.of(editorTheme())
-      ]
-    })
+    state: createEditorState(pane, "")
   });
   pane.host.addEventListener("focusin", () => setActivePane(pane.id));
   pane.element.addEventListener("pointerdown", (event) => {
@@ -987,11 +1039,15 @@ function setPaneEditorContent(pane: EditorPaneState, content: string): void {
   if (!pane.view) {
     return;
   }
+  const key = paneDocumentKey(pane);
+  const cached = key ? pane.stateCache.get(key) : null;
+  const state = cached?.doc.toString() === content ? cached : createEditorState(pane, content);
   pane.programmaticChange = true;
-  pane.view.dispatch({
-    changes: { from: 0, to: pane.view.state.doc.length, insert: content }
-  });
+  pane.view.setState(state);
   pane.programmaticChange = false;
+  if (key) {
+    pane.stateCache.set(key, state);
+  }
   updateMinimap();
 }
 
@@ -1897,9 +1953,12 @@ async function applyTabTitle(id: string, title: string): Promise<void> {
   tab.title = nextTitle;
   tab.updatedAt = nowIso();
   contentCache.set(id, tab);
+  const savedVersion = tab.updatedAt;
   const saved = ensureTab(await window.textEditor.saveTab(tab));
-  contentCache.set(id, saved);
-  updateMetaFromDocument(saved);
+  const latest = contentCache.get(id);
+  const current = latest && latest.updatedAt !== savedVersion ? ensureTab({ ...latest, title: saved.title }) : saved;
+  contentCache.set(id, current);
+  updateMetaFromDocument(current);
   renderSidebar();
   updatePaneTitles();
   updateStatus();
@@ -1943,6 +2002,7 @@ async function activateTab(id: string, options: { flushCurrent?: boolean; childT
   const children = getChildTabs(tab);
   const requestedChildId = options.childTabId ?? pane.activeChildTabId ?? tab.activeChildTabId ?? MAIN_CHILD_TAB_ID;
   const child = children.find((entry) => entry.id === requestedChildId) ?? children.find((entry) => entry.id === tab.activeChildTabId) ?? children[0];
+  cachePaneEditorState(pane);
   pane.activeTabId = id;
   pane.activeChildTabId = child.id;
   tab.activeChildTabId = child.id;
@@ -1956,6 +2016,7 @@ async function activateTab(id: string, options: { flushCurrent?: boolean; childT
   setPaneEditorEnabled(pane, true);
   renderSidebar();
   updateStatus();
+  pane.view?.focus();
 }
 
 async function openTabInPane(id: string, paneId: PaneId, childTabId?: string): Promise<void> {
@@ -1994,6 +2055,7 @@ async function createNewTab(targetGroupIdOverride?: string | null): Promise<void
     selectedGroupId = targetGroupId;
     expandTargetGroup(targetGroupId);
     tabIndex = insertTabIntoIndexGroup(tabIndex, id, targetGroupId);
+    cachePaneEditorState(activePane());
     activePane().activeTabId = id;
     activePane().activeChildTabId = MAIN_CHILD_TAB_ID;
     workspace.openedTabIds = Array.from(new Set([...workspace.openedTabIds, id]));
@@ -2083,6 +2145,7 @@ async function activateChildTab(tabId: string, childTabId: string, paneId?: Pane
   if (!child) {
     return;
   }
+  cachePaneEditorState(targetPane);
   targetPane.activeChildTabId = child.id;
   tab.activeChildTabId = child.id;
   contentCache.set(tabId, tab);
@@ -2163,6 +2226,7 @@ async function deleteChildTab(tabId: string, childTabId: string): Promise<void> 
   updateMetaFromDocument(updated);
   (Object.values(panes) as EditorPaneState[]).forEach((pane) => {
     if (pane.activeTabId === tabId && pane.activeChildTabId === childTabId) {
+      cachePaneEditorState(pane);
       pane.activeChildTabId = MAIN_CHILD_TAB_ID;
       setPaneEditorContent(pane, childTabForPane(updated, pane).content);
     }
@@ -2330,6 +2394,7 @@ async function duplicateTab(id: string): Promise<void> {
   workspace.openedTabIds = Array.from(new Set([...workspace.openedTabIds, newId]));
   workspace.openedTabIds = flattenedOpenedTabIds();
   workspace.recentTabIds = [newId, ...workspace.recentTabIds.filter((entry) => entry !== newId)].slice(0, 20);
+  cachePaneEditorState(activePane());
   activePane().activeTabId = newId;
   activePane().activeChildTabId = duplicated.activeChildTabId ?? MAIN_CHILD_TAB_ID;
   syncActiveTabId();
@@ -2530,6 +2595,7 @@ async function splitRight(): Promise<void> {
   workspace.layout.splitMode = "vertical";
   workspace.layout.splitRatio = workspace.layout.splitRatio || 0.5;
   if (!panes.right.activeTabId) {
+    cachePaneEditorState(panes.right);
     panes.right.activeTabId = panes.left.activeTabId;
     panes.right.activeChildTabId = panes.left.activeChildTabId;
     if (panes.right.activeTabId) {
@@ -2547,6 +2613,7 @@ async function splitRight(): Promise<void> {
 
 async function closeSplit(): Promise<void> {
   workspace.layout.splitMode = "single";
+  cachePaneEditorState(panes.right);
   panes.right.activeTabId = null;
   panes.right.activeChildTabId = MAIN_CHILD_TAB_ID;
   setPaneEditorContent(panes.right, "");
@@ -2921,6 +2988,9 @@ document.addEventListener("dragend", () => {
 });
 
 document.addEventListener("keydown", (event) => {
+  if (event.defaultPrevented) {
+    return;
+  }
   const mod = event.ctrlKey || event.metaKey;
   const key = event.key.toLowerCase();
   const shortcutActions: Record<string, MenuAction> = {
