@@ -79,6 +79,14 @@ const api = {
     ipcRenderer.on("remote-inbox:append-request", listener);
     return () => ipcRenderer.removeListener("remote-inbox:append-request", listener);
   },
+  auditRemoteInboxPcClear: (payload: { tabId: string; targetTabName: string; revision: number; beforeCharacters: number }): Promise<void> => ipcRenderer.invoke("remote-inbox:pc-clear-audit", payload),
+  onRemoteInboxMutate: (callback: (request: { id: string; operation: "replace" | "clear"; targetTabName: string; content: string; revision: number }) => Promise<{ ok: true; tabId: string; content: string; revision: number; updatedAt: string; beforeCharacters: number } | { ok: false; error: string; conflict?: boolean; tabId?: string; revision?: number; updatedAt?: string }>): (() => void) => {
+    const listener = (_event: Electron.IpcRendererEvent, request: { id: string; operation: "replace" | "clear"; targetTabName: string; content: string; revision: number }): void => {
+      void callback(request).then((result) => ipcRenderer.send("remote-inbox:mutate-result", { id: request.id, ...result }), (error: unknown) => ipcRenderer.send("remote-inbox:mutate-result", { id: request.id, ok: false, error: error instanceof Error ? error.message : "Save failed" }));
+    };
+    ipcRenderer.on("remote-inbox:mutate-request", listener);
+    return () => ipcRenderer.removeListener("remote-inbox:mutate-request", listener);
+  },
   onMenuAction: (callback: (action: MenuAction) => void): (() => void) => {
     const listener = (_event: Electron.IpcRendererEvent, action: MenuAction): void => callback(action);
     ipcRenderer.on("menu:action", listener);

@@ -13,6 +13,7 @@ export interface RemoteInboxSettings {
   port: number;
   targetTabName: string;
   targetTabNames: string[];
+  remoteReadableTabIds: string[];
   includeTimestamp: boolean;
   notifyOnReceive: boolean;
   accessTeamDomain: string;
@@ -85,6 +86,7 @@ export interface TabDocument {
   activeChildTabId?: string;
   childTabs?: ChildTabDocument[];
   updatedAt: string;
+  revision?: number;
 }
 
 export interface AppStateSnapshot {
@@ -173,6 +175,7 @@ export const defaultWorkspace: WorkspaceState = {
     port: 48731,
     targetTabName: "Remote Inbox",
     targetTabNames: ["Remote Inbox"],
+    remoteReadableTabIds: [],
     includeTimestamp: true,
     notifyOnReceive: true,
     accessTeamDomain: "",
@@ -329,7 +332,8 @@ export function normalizeTabDocument(input: TabDocument): TabDocument {
     content: mainChild.content,
     activeChildTabId,
     childTabs: children,
-    updatedAt
+    updatedAt,
+    revision: Number.isInteger(input.revision) && (input.revision ?? 0) >= 0 ? input.revision : 0
   };
 }
 

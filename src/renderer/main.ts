@@ -177,6 +177,7 @@ type EditorPaneState = {
   stateCache: Map<string, EditorState>;
   fontSizeCompartment: Compartment;
   themeCompartment: Compartment;
+  readOnlyCompartment: Compartment;
 };
 
 const panes: Record<PaneId, EditorPaneState> = {
@@ -192,7 +193,8 @@ const panes: Record<PaneId, EditorPaneState> = {
     programmaticChange: false,
     stateCache: new Map(),
     fontSizeCompartment: new Compartment(),
-    themeCompartment: new Compartment()
+    themeCompartment: new Compartment(),
+    readOnlyCompartment: new Compartment()
   },
   right: {
     id: "right",
@@ -206,7 +208,8 @@ const panes: Record<PaneId, EditorPaneState> = {
     programmaticChange: false,
     stateCache: new Map(),
     fontSizeCompartment: new Compartment(),
-    themeCompartment: new Compartment()
+    themeCompartment: new Compartment(),
+    readOnlyCompartment: new Compartment()
   }
 };
 
@@ -887,6 +890,17 @@ function activeDocument(): TabDocument | null {
   return id ? contentCache.get(id) ?? null : null;
 }
 
+function isRemoteInboxTabId(id: string | null | undefined): boolean {
+  const title = id ? tabMeta(id)?.title ?? contentCache.get(id)?.title : "";
+  if (!title) return false;
+  return new Set([workspace.remoteInbox.targetTabName, ...workspace.remoteInbox.targetTabNames]).has(title);
+}
+
+function editorReadOnlyExtensions(pane: EditorPaneState) {
+  const readOnly = isRemoteInboxTabId(pane.activeTabId);
+  return [EditorState.readOnly.of(readOnly), EditorView.editable.of(!readOnly)];
+}
+
 function updateMetaFromDocument(tab: TabDocument): void {
   const normalized = ensureTab(tab);
   const meta: TabMeta = {
@@ -1155,7 +1169,8 @@ function createEditorState(pane: EditorPaneState, content: string): EditorState 
         ...historyKeymap
       ]),
       pane.fontSizeCompartment.of([]),
-      pane.themeCompartment.of(editorTheme())
+      pane.themeCompartment.of(editorTheme()),
+      pane.readOnlyCompartment.of(editorReadOnlyExtensions(pane))
     ]
   });
 }
@@ -1183,6 +1198,7 @@ function setPaneEditorContent(pane: EditorPaneState, content: string): void {
   const state = cached?.doc.toString() === content ? cached : createEditorState(pane, content);
   pane.programmaticChange = true;
   pane.view.setState(state);
+  pane.view.dispatch({ effects: pane.readOnlyCompartment.reconfigure(editorReadOnlyExtensions(pane)) });
   pane.programmaticChange = false;
   if (key) {
     pane.stateCache.set(key, state);
@@ -1302,7 +1318,7 @@ function updateStatus(): void {
   if (document.activeElement !== activeTitleInput) {
     activeTitleInput.value = tab.title;
   }
-  activeTitleInput.disabled = false;
+  activeTitleInput.disabled = isRemoteInboxTabId(tab.id);
   activeMeta.textContent = `${tab.id} > ${child.title} / ${lineCount} ${label.lines} / ${countWords(child.content)} ${label.words}`;
   updateStatusLine(tab);
 }
@@ -1368,7 +1384,7 @@ function renderChildTabBars(): void {
           `
         )
         .join("")}
-      <button type="button" class="child-tab-add" data-action="new-child-tab" data-pane-id="${pane.id}" data-id="${normalized.id}" title="${escapeHtml(text().newChildTab)}">+</button>
+      ${isRemoteInboxTabId(normalized.id) ? "" : `<button type="button" class="child-tab-add" data-action="new-child-tab" data-pane-id="${pane.id}" data-id="${normalized.id}" title="${escapeHtml(text().newChildTab)}">+</button>`}
     `;
   });
 }
@@ -1429,7 +1445,7 @@ function renderTabRows(tabIds: string[], groupId: string | null): string {
     .filter((tab): tab is TabMeta => Boolean(tab))
     .map(
       (tab) => `
-        <div class="tab-row ${tab.id === activeTabId ? "is-active" : ""}" data-id="${tab.id}" data-group-id="${groupId ?? UNGROUPED_GROUP_ID}" draggable="true">
+        <div class="tab-row ${tab.id === activeTabId ? "is-active" : ""}" data-id="${tab.id}" data-group-id="${groupId ?? UNGROUPED_GROUP_ID}" draggable="${isRemoteInboxTabId(tab.id) ? "false" : "true"}">
           <button type="button" class="tab-title" data-action="activate-tab" data-id="${tab.id}">
             <span class="tab-name">${tab.pinned ? `<span class="pin-mark" aria-hidden="true">●</span>` : ""}${escapeHtml(tab.title)}</span>
             <small>${tab.wordCount} ${text().words}</small>
@@ -1831,7 +1847,11 @@ function showContextMenu(tabId: string, x: number, y: number): void {
   const pinned = isTabPinned(tabId);
   const menu = document.createElement("div");
   menu.className = "context-menu";
-  menu.innerHTML = `
+  menu.innerHTML = isRemoteInboxTabId(tabId) ? `
+    <button type="button" data-action="open-tab-main" data-id="${tabId}">${label.openInMain}</button>
+    <button type="button" data-action="open-tab-sub" data-id="${tabId}">${label.openInSub}</button>
+    <button type="button" data-action="clear-remote-inbox" data-id="${tabId}">${workspace.locale === "jp" ? "Remote Inboxをクリア" : "Clear Remote Inbox"}</button>
+  ` : `
     <button type="button" data-action="open-tab-main" data-id="${tabId}">${label.openInMain}</button>
     <button type="button" data-action="open-tab-sub" data-id="${tabId}">${label.openInSub}</button>
     <button type="button" data-action="toggle-pin-tab" data-id="${tabId}">${pinned ? label.unpinTab : label.pinTab}</button>
@@ -1880,6 +1900,7 @@ function showSidebarBlankContextMenu(x: number, y: number): void {
 }
 
 function showChildContextMenu(tabId: string, childTabId: string, x: number, y: number): void {
+  if (isRemoteInboxTabId(tabId)) return;
   closeContextMenu();
   const label = text();
   const isMain = childTabId === MAIN_CHILD_TAB_ID;
@@ -1959,6 +1980,7 @@ function openSettingsDialog(): void {
       <label class="settings-field">${workspace.locale === "jp" ? "ローカル待受ポート" : "Local listening port"}<input name="remote-port" type="number" min="1024" max="65535" value="${workspace.remoteInbox.port}" /></label>
       <label class="settings-field">${workspace.locale === "jp" ? "受信先タブ名" : "Target tab name"}<input name="remote-tab" value="${escapeHtml(workspace.remoteInbox.targetTabName)}" /></label>
       <label class="settings-field">${workspace.locale === "jp" ? "受信先候補（1行に1件）" : "Target choices (one per line)"}<textarea name="remote-targets" rows="4">${escapeHtml(workspace.remoteInbox.targetTabNames.join("\n"))}</textarea></label>
+      <fieldset class="settings-field"><legend>${workspace.locale === "jp" ? "リモート閲覧を許可する通常タブ" : "Normal tabs allowed for remote viewing"}</legend>${tabIndex.tabs.filter((tab) => !workspace.remoteInbox.targetTabNames.includes(tab.title)).map((tab) => `<label class="settings-check"><input type="checkbox" name="remote-readable-tab" value="${escapeHtml(tab.id)}" ${workspace.remoteInbox.remoteReadableTabIds.includes(tab.id) ? "checked" : ""} /><span>${escapeHtml(tab.title)}</span></label>`).join("") || `<span class="dialog-note">${workspace.locale === "jp" ? "通常タブがありません" : "No normal tabs"}</span>`}</fieldset>
       <label class="settings-check"><input type="checkbox" name="remote-timestamp" ${workspace.remoteInbox.includeTimestamp ? "checked" : ""} /><span>${workspace.locale === "jp" ? "受信日時を付ける" : "Include received timestamp"}</span></label>
       <label class="settings-check"><input type="checkbox" name="remote-notify" ${workspace.remoteInbox.notifyOnReceive ? "checked" : ""} /><span>${workspace.locale === "jp" ? "受信時にデスクトップ通知する" : "Show desktop notification"}</span></label>
       <label class="settings-field">Cloudflare Access Team Domain<input name="remote-domain" type="url" placeholder="https://example.cloudflareaccess.com" value="${escapeHtml(workspace.remoteInbox.accessTeamDomain)}" /></label>
@@ -2002,13 +2024,14 @@ function openSettingsDialog(): void {
     const targetTabName = form.querySelector<HTMLInputElement>('input[name="remote-tab"]')?.value.trim() ?? "";
     const targetTabNames = (form.querySelector<HTMLTextAreaElement>('textarea[name="remote-targets"]')?.value ?? "").split(/\r?\n/).map((name) => name.trim()).filter((name, index, names) => Boolean(name) && name.length <= 120 && !/[\u0000-\u001F\u007F]/.test(name) && names.indexOf(name) === index).slice(0, 30);
     const accessTeamDomain = form.querySelector<HTMLInputElement>('input[name="remote-domain"]')?.value.trim() ?? "";
+    const remoteReadableTabIds = [...form.querySelectorAll<HTMLInputElement>('input[name="remote-readable-tab"]:checked')].map((input) => input.value);
     if (!Number.isInteger(port) || port < 1024 || port > 65535 || !targetTabName || targetTabName.length > 120 || /[\u0000-\u001F\u007F]/.test(targetTabName) || !targetTabNames.length) { setSaveState(workspace.locale === "jp" ? "遠隔書き込みの設定が不正です" : "Remote writing settings are invalid", "error"); return; }
-    workspace.remoteInbox = { enabled: Boolean(form.querySelector<HTMLInputElement>('input[name="remote-enabled"]')?.checked), port, targetTabName, targetTabNames, includeTimestamp: Boolean(form.querySelector<HTMLInputElement>('input[name="remote-timestamp"]')?.checked), notifyOnReceive: Boolean(form.querySelector<HTMLInputElement>('input[name="remote-notify"]')?.checked), accessTeamDomain, accessAudience: form.querySelector<HTMLInputElement>('input[name="remote-audience"]')?.value.trim() ?? "", allowedEmail: form.querySelector<HTMLInputElement>('input[name="remote-email"]')?.value.trim() ?? "" };
+    workspace.remoteInbox = { enabled: Boolean(form.querySelector<HTMLInputElement>('input[name="remote-enabled"]')?.checked), port, targetTabName, targetTabNames, remoteReadableTabIds, includeTimestamp: Boolean(form.querySelector<HTMLInputElement>('input[name="remote-timestamp"]')?.checked), notifyOnReceive: Boolean(form.querySelector<HTMLInputElement>('input[name="remote-notify"]')?.checked), accessTeamDomain, accessAudience: form.querySelector<HTMLInputElement>('input[name="remote-audience"]')?.value.trim() ?? "", allowedEmail: form.querySelector<HTMLInputElement>('input[name="remote-email"]')?.value.trim() ?? "" };
     workspace.templates = {
       ...workspace.templates,
       custom: [MAIN_CHILD_TAB_TITLE, ...normalizeTemplateTitles(workspace.templates?.custom).slice(1)]
     };
-    void saveWorkspace().then(() => setSaveState(label.templateSaved));
+    void saveWorkspace().then(() => { (Object.values(panes) as EditorPaneState[]).forEach((pane) => pane.view?.dispatch({ effects: pane.readOnlyCompartment.reconfigure(editorReadOnlyExtensions(pane)) })); setSaveState(label.templateSaved); });
     overlay.remove();
   });
   document.body.appendChild(overlay);
@@ -3182,6 +3205,7 @@ async function performAction(
   else if (action === "rename-tab" && id) await renameTab(id);
   else if (action === "toggle-pin-tab" && id) await togglePinTab(id);
   else if (action === "duplicate-tab" && id) await duplicateTab(id);
+  else if (action === "clear-remote-inbox" && id) await clearRemoteInboxTab(id);
   else if (action === "ungroup-tab" && id) await ungroupTab(id);
   else if (action === "delete-tab" && id) await deleteTab(id);
   else if (action === "restore-backup" && id && fileName) {
@@ -3520,6 +3544,9 @@ async function appendRemoteInbox(textValue: string, includeTimestamp: boolean, t
     });
     tabIndex = insertTabIntoIndexGroup(tabIndex, id, null);
     await saveTabsIndex();
+    workspace.openedTabIds = workspace.openedTabIds.includes(id) ? workspace.openedTabIds : [...workspace.openedTabIds, id];
+    workspace.recentTabIds = [id, ...workspace.recentTabIds.filter((tabId) => tabId !== id)];
+    await saveWorkspace();
     meta = tabIndex.tabs.find((entry) => entry.id === id);
   }
   const main = getMainChildTab(tab);
@@ -3527,6 +3554,7 @@ async function appendRemoteInbox(textValue: string, includeTimestamp: boolean, t
   const content = main.content ? `${main.content}\n\n${entry}` : entry;
   const updated = setChildContent(tab, MAIN_CHILD_TAB_ID, content);
   updated.updatedAt = nowIso();
+  updated.revision = (tab.revision ?? 0) + 1;
   contentCache.set(updated.id, updated);
   updateMetaFromDocument(updated);
   for (const pane of Object.values(panes) as EditorPaneState[]) {
@@ -3546,7 +3574,58 @@ async function appendRemoteInbox(textValue: string, includeTimestamp: boolean, t
   updateStatus();
 }
 
+async function mutateRemoteInbox(operation: "replace" | "clear", targetTabName: string, contentValue: string, expectedRevision: number): Promise<{ ok: true; tabId: string; content: string; revision: number; updatedAt: string; beforeCharacters: number } | { ok: false; error: string; conflict?: boolean; tabId?: string; revision?: number; updatedAt?: string }> {
+  const title = targetTabName.trim();
+  let meta = tabIndex.tabs.find((entry) => entry.title === title);
+  let tab: TabDocument;
+  if (meta) {
+    tab = await loadTabToCache(meta.id);
+  } else {
+    if (expectedRevision !== 0) return { ok: false, error: "Revision conflict", conflict: true, revision: 0, updatedAt: new Date(0).toISOString() };
+    const id = nextTabId();
+    const updatedAt = nowIso();
+    tab = ensureTab({ id, title, content: "", activeChildTabId: MAIN_CHILD_TAB_ID, childTabs: [{ id: MAIN_CHILD_TAB_ID, title: localizedMainChildTitle(), content: "", updatedAt }], updatedAt, revision: 0 });
+    contentCache.set(id, tab);
+    updateMetaFromDocument(tab);
+    tabIndex = normalizeTabsIndex({ ...tabIndex, tabs: tabIndex.tabs.map((entry) => entry.id === id ? { ...entry, pinned: true } : entry) });
+    tabIndex = insertTabIntoIndexGroup(tabIndex, id, null);
+    await saveTabsIndex();
+    workspace.openedTabIds = workspace.openedTabIds.includes(id) ? workspace.openedTabIds : [...workspace.openedTabIds, id];
+    workspace.recentTabIds = [id, ...workspace.recentTabIds.filter((tabId) => tabId !== id)];
+    await saveWorkspace();
+    meta = tabIndex.tabs.find((entry) => entry.id === id);
+  }
+  const currentRevision = tab.revision ?? 0;
+  if (currentRevision !== expectedRevision) return { ok: false, error: "Revision conflict", conflict: true, tabId: tab.id, revision: currentRevision, updatedAt: tab.updatedAt };
+  const nextContent = operation === "clear" ? "" : contentValue;
+  const beforeCharacters = getMainChildTab(tab).content.length;
+  const updated = setChildContent(tab, MAIN_CHILD_TAB_ID, nextContent);
+  updated.revision = currentRevision + 1;
+  updated.updatedAt = nowIso();
+  const saved = ensureTab(await window.textEditor.saveTab(updated));
+  contentCache.set(saved.id, saved);
+  updateMetaFromDocument(saved);
+  dirtyTabIds.delete(saved.id);
+  for (const pane of Object.values(panes) as EditorPaneState[]) {
+    if (pane.activeTabId === saved.id && pane.activeChildTabId === MAIN_CHILD_TAB_ID) setPaneEditorContent(pane, nextContent);
+  }
+  renderSidebar();
+  updateStatus();
+  return { ok: true, tabId: saved.id, content: nextContent, revision: saved.revision ?? updated.revision, updatedAt: saved.updatedAt, beforeCharacters };
+}
+
+async function clearRemoteInboxTab(id: string): Promise<void> {
+  if (!isRemoteInboxTabId(id)) return;
+  const tab = await loadTabToCache(id);
+  const confirmed = window.confirm(workspace.locale === "jp" ? "Remote Inboxの内容をすべて削除します。\nこの操作は元に戻せません。" : "Delete all Remote Inbox content.\nThis action cannot be undone.");
+  if (!confirmed) return;
+  const result = await mutateRemoteInbox("clear", tab.title, "", tab.revision ?? 0);
+  if (!result.ok) throw new Error(result.error);
+  await window.textEditor.auditRemoteInboxPcClear({ tabId: result.tabId, targetTabName: tab.title, revision: result.revision, beforeCharacters: result.beforeCharacters });
+}
+
 window.textEditor.onRemoteInboxAppend(async (request) => appendRemoteInbox(request.text, request.includeTimestamp, request.targetTabName));
+window.textEditor.onRemoteInboxMutate(async (request) => mutateRemoteInbox(request.operation, request.targetTabName, request.content, request.revision));
 
 async function bootstrap(): Promise<void> {
   createEditor(panes.left);

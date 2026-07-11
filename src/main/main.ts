@@ -29,7 +29,7 @@ import {
   normalizeTabDocument,
   normalizeTabsIndex
 } from "../shared/schema.js";
-import { RemoteInboxServer, type RemoteInboxStatus } from "./remoteInbox.js";
+import { RemoteInboxServer, type RemoteInboxMutationResult, type RemoteInboxStatus } from "./remoteInbox.js";
 
 type MenuAction =
   | "new-tab"
@@ -67,6 +67,7 @@ let startupRecoveryState: RecoveryState = { abnormalShutdown: false };
 let remoteInboxStatus: RemoteInboxStatus = { state: "stopped" };
 let remoteInboxSettings = defaultWorkspace.remoteInbox;
 const pendingRemoteAppends = new Map<string, { resolve: (value: { ok: boolean; error?: string }) => void; timer: NodeJS.Timeout }>();
+const pendingRemoteMutations = new Map<string, { resolve: (value: RemoteInboxMutationResult) => void; timer: NodeJS.Timeout }>();
 
 const menuLabels: Record<
   Locale,
@@ -352,6 +353,7 @@ function normalizeWorkspace(input: Partial<WorkspaceState>): WorkspaceState {
       port: Number.isInteger(input.remoteInbox?.port) && (input.remoteInbox?.port ?? 0) >= 1024 && (input.remoteInbox?.port ?? 0) <= 65535 ? input.remoteInbox!.port : defaultWorkspace.remoteInbox.port,
       targetTabName: normalizeRemoteInboxTargetName(input.remoteInbox?.targetTabName),
       targetTabNames: normalizeRemoteInboxTargetNames(input.remoteInbox?.targetTabNames, typeof input.remoteInbox?.targetTabName === "string" ? input.remoteInbox.targetTabName : defaultWorkspace.remoteInbox.targetTabName),
+      remoteReadableTabIds: Array.isArray(input.remoteInbox?.remoteReadableTabIds) ? [...new Set(input.remoteInbox.remoteReadableTabIds.filter((id): id is string => typeof id === "string" && /^tab-[A-Za-z0-9_-]+$/.test(id)))].slice(0, 500) : [],
       includeTimestamp: input.remoteInbox?.includeTimestamp !== false,
       notifyOnReceive: input.remoteInbox?.notifyOnReceive !== false,
       accessTeamDomain: typeof input.remoteInbox?.accessTeamDomain === "string" ? input.remoteInbox.accessTeamDomain.trim() : "",
@@ -835,6 +837,48 @@ const remoteInboxServer = new RemoteInboxServer({
       try { new Notification({ title: "Remote memo received", body: `${targetTabName} was updated.` }).show(); } catch { /* notification does not affect save */ }
     }
     return result.ok ? { ok: true, receivedAt: localIsoWithOffset() } : { ok: false, error: result.error ?? "Save failed" };
+  },
+  read: async (targetTabName) => {
+    const index = await loadIndex();
+    const meta = index.tabs.find((tab) => tab.title === targetTabName);
+    if (!meta) return { content: "" };
+    try {
+      const tab = normalizeTabDocument(await readJson<TabDocument>(tabPath(meta.id), { id: meta.id, title: meta.title, content: "", updatedAt: meta.updatedAt }));
+      return { content: getMainChildTab(tab).content };
+    } catch {
+      return { error: "Read failed" };
+    }
+  },
+  getRemoteInbox: async (targetTabName) => {
+    const index = await loadIndex();
+    const meta = index.tabs.find((tab) => tab.title === targetTabName);
+    if (!meta) return { target: targetTabName, content: "", revision: 0, updatedAt: new Date(0).toISOString() };
+    const tab = normalizeTabDocument(await readJson<TabDocument>(tabPath(meta.id), { id: meta.id, title: meta.title, content: "", updatedAt: meta.updatedAt, revision: 0 }));
+    return { id: tab.id, target: targetTabName, content: getMainChildTab(tab).content, revision: tab.revision ?? 0, updatedAt: tab.updatedAt };
+  },
+  mutateRemoteInbox: async (operation, targetTabName, content, revision) => {
+    const window = BrowserWindow.getAllWindows()[0];
+    if (!window || window.isDestroyed() || window.webContents.isDestroyed()) return { ok: false, error: "Renderer unavailable" };
+    const id = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    return new Promise<RemoteInboxMutationResult>((resolve) => {
+      const timer = setTimeout(() => { pendingRemoteMutations.delete(id); resolve({ ok: false, error: "Renderer timeout" }); }, 10_000);
+      pendingRemoteMutations.set(id, { resolve, timer });
+      window.webContents.send("remote-inbox:mutate-request", { id, operation, targetTabName, content, revision });
+    });
+  },
+  listTabs: async () => {
+    const index = await loadIndex();
+    const allowed = new Set(remoteInboxSettings.remoteReadableTabIds);
+    const remoteNames = new Set(remoteInboxSettings.targetTabNames);
+    return index.tabs.filter((tab) => allowed.has(tab.id) && !remoteNames.has(tab.title)).map((tab) => ({ id: tab.id, title: tab.title, pinned: Boolean(tab.pinned), updatedAt: tab.updatedAt }));
+  },
+  readTab: async (id) => {
+    if (!remoteInboxSettings.remoteReadableTabIds.includes(id)) return null;
+    const index = await loadIndex();
+    const meta = index.tabs.find((tab) => tab.id === id && !remoteInboxSettings.targetTabNames.includes(tab.title));
+    if (!meta) return null;
+    const tab = normalizeTabDocument(await readJson<TabDocument>(tabPath(meta.id), { id: meta.id, title: meta.title, content: "", updatedAt: meta.updatedAt }));
+    return { id: meta.id, title: meta.title, pinned: Boolean(meta.pinned), updatedAt: tab.updatedAt, content: getMainChildTab(tab).content };
   }
 });
 
@@ -886,6 +930,17 @@ ipcMain.on("remote-inbox:append-result", (_event, payload: { id?: string; ok?: b
   clearTimeout(pending.timer);
   pendingRemoteAppends.delete(payload.id);
   pending.resolve({ ok: Boolean(payload.ok), error: typeof payload.error === "string" ? payload.error : undefined });
+});
+ipcMain.on("remote-inbox:mutate-result", (_event, payload: RemoteInboxMutationResult & { id?: string }) => {
+  if (typeof payload?.id !== "string") return;
+  const pending = pendingRemoteMutations.get(payload.id);
+  if (!pending) return;
+  clearTimeout(pending.timer);
+  pendingRemoteMutations.delete(payload.id);
+  pending.resolve(payload);
+});
+ipcMain.handle("remote-inbox:pc-clear-audit", async (_event, payload: { tabId: string; targetTabName: string; revision: number; beforeCharacters: number }): Promise<void> => {
+  await remoteInboxServer.auditPcClear(payload.tabId, payload.targetTabName, payload.revision, payload.beforeCharacters);
 });
 
 ipcMain.handle("tabs:index:save", async (_event, index: TabsIndex): Promise<TabsIndex> => {

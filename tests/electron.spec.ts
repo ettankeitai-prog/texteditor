@@ -11,6 +11,7 @@ type TabDocument = {
   activeChildTabId?: string;
   childTabs?: Array<{ id: string; title: string; content: string; updatedAt: string }>;
   updatedAt: string;
+  revision?: number;
 };
 
 type TabsIndex = {
@@ -885,24 +886,35 @@ test.describe("Text Editor Electron MVP", () => {
     }
   });
 
-  test("Remote Inbox form is minimal and only accepts configured targets", async ({}, testInfo) => {
+  test("Remote Inbox supports configured-target writing and read-only viewing", async ({}, testInfo) => {
     const { RemoteInboxServer } = await import("../dist/main/remoteInbox.js");
     const port = 49000 + (process.pid % 1000);
     const appends: Array<{ text: string; target: string }> = [];
+    let remoteDocument = { target: "Remote Inbox", content: "初期本文", revision: 3, updatedAt: "2026-07-12T05:30:00.000Z" };
     const server = new RemoteInboxServer({
       dataRoot: () => testInfo.outputDir,
-      getSettings: () => ({ enabled: true, port, targetTabName: "Remote Inbox", targetTabNames: ["Remote Inbox", "買い物メモ"], includeTimestamp: true, notifyOnReceive: false, accessTeamDomain: "https://team.cloudflareaccess.com", accessAudience: "audience", allowedEmail: "me@example.com" }),
+      getSettings: () => ({ enabled: true, port, targetTabName: "Remote Inbox", targetTabNames: ["Remote Inbox", "買い物メモ"], remoteReadableTabIds: ["tab-normal"], includeTimestamp: true, notifyOnReceive: false, accessTeamDomain: "https://team.cloudflareaccess.com", accessAudience: "audience", allowedEmail: "me@example.com" }),
       onStatus: () => undefined,
-      append: async (text: string, _includeTimestamp: boolean, target: string) => { appends.push({ text, target }); return { ok: true as const, receivedAt: "2026-07-11T14:10:00+09:00" }; }
+      append: async (text: string, _includeTimestamp: boolean, target: string) => { appends.push({ text, target }); return { ok: true as const, receivedAt: "2026-07-11T14:10:00+09:00" }; },
+      read: async () => ({ content: "[2026-07-11 14:10]\n古いメモ\n\n[2026-07-11 14:15]\n<script>最新メモ</script>" }),
+      getRemoteInbox: async () => remoteDocument,
+      mutateRemoteInbox: async (operation: "replace" | "clear", _target: string, content: string, revision: number) => {
+        if (revision !== remoteDocument.revision) return { ok: false as const, error: "Revision conflict", conflict: true, revision: remoteDocument.revision, updatedAt: remoteDocument.updatedAt };
+        remoteDocument = { ...remoteDocument, content: operation === "clear" ? "" : content, revision: revision + 1, updatedAt: "2026-07-12T05:31:00.000Z" };
+        return { ok: true as const, tabId: "tab-inbox", content: remoteDocument.content, revision: remoteDocument.revision, updatedAt: remoteDocument.updatedAt, beforeCharacters: operation === "clear" ? "全文更新".length : "初期本文".length };
+      },
+      listTabs: async () => [{ id: "tab-normal", title: "通常タブ", pinned: false, updatedAt: "2026-07-12T04:00:00.000Z" }],
+      readTab: async (id: string) => id === "tab-normal" ? { id, title: "通常タブ", pinned: false, updatedAt: "2026-07-12T04:00:00.000Z", content: "閲覧専用" } : null
     });
     (server as unknown as { verify: () => Promise<string> }).verify = async () => "me@example.com";
     await server.configure();
     try {
       const form = await fetch(`http://127.0.0.1:${port}/`);
       const html = await form.text();
-      expect(html.match(/<(select|textarea|button)\b/g)).toHaveLength(3);
       expect(html).not.toContain("<h1");
-      expect(html).not.toContain("role=\"status\"");
+      expect(html).toContain('id="inbox-mode"');
+      expect(html).toContain('id="tabs-mode"');
+      expect(html).toContain('id="editor"');
       expect(html).toContain('value="買い物メモ"');
       const cookie = form.headers.get("set-cookie") ?? "";
       const token = /remoteInboxCsrf=([^;]+)/.exec(cookie)?.[1];
@@ -917,23 +929,69 @@ test.describe("Text Editor Electron MVP", () => {
       await expect(post({ target: "a".repeat(121), text: "拒否" })).resolves.toMatchObject({ status: 400 });
       await expect(post({ text: "旧クライアント" })).resolves.toMatchObject({ status: 200 });
       expect(appends.at(-1)).toEqual({ text: "旧クライアント", target: "Remote Inbox" });
+      const read = async (query: string) => fetch(`http://127.0.0.1:${port}/api/read?${query}`, { headers: { "Cf-Access-Jwt-Assertion": "test" } });
+      const newest = await read("target=%E8%B2%B7%E3%81%84%E7%89%A9%E3%83%A1%E3%83%A2&limit=1");
+      expect(newest.status).toBe(200);
+      await expect(newest.json()).resolves.toMatchObject({ target: "買い物メモ", order: "new", content: "[2026-07-11 14:15]\n<script>最新メモ</script>", nextCursor: 1 });
+      const oldest = await read("target=%E8%B2%B7%E3%81%84%E7%89%A9%E3%83%A1%E3%83%A2&order=old&cursor=1");
+      await expect(oldest.json()).resolves.toMatchObject({ order: "old", content: "[2026-07-11 14:15]\n<script>最新メモ</script>", nextCursor: null });
+      await expect(read("target=%E6%9C%AA%E7%99%BB%E9%8C%B2")).resolves.toMatchObject({ status: 400 });
+      const apiHeaders = { Cookie: cookie, "X-CSRF-Token": token!, "Cf-Access-Jwt-Assertion": "test", "Content-Type": "application/json" };
+      const inbox = await fetch(`http://127.0.0.1:${port}/api/remote-inbox`, { headers: { "Cf-Access-Jwt-Assertion": "test" } });
+      await expect(inbox.json()).resolves.toMatchObject({ content: "初期本文", revision: 3 });
+      await expect(fetch(`http://127.0.0.1:${port}/api/remote-inbox`, { method: "PUT", headers: { "Cf-Access-Jwt-Assertion": "test", "Content-Type": "application/json" }, body: JSON.stringify({ content: "拒否", revision: 3 }) })).resolves.toMatchObject({ status: 403 });
+      const replaced = await fetch(`http://127.0.0.1:${port}/api/remote-inbox`, { method: "PUT", headers: apiHeaders, body: JSON.stringify({ content: "全文更新", revision: 3 }) });
+      await expect(replaced.json()).resolves.toMatchObject({ ok: true, content: "全文更新", revision: 4 });
+      await expect(fetch(`http://127.0.0.1:${port}/api/remote-inbox`, { method: "PUT", headers: apiHeaders, body: JSON.stringify({ content: "古い画面", revision: 3 }) })).resolves.toMatchObject({ status: 409 });
+      await expect(fetch(`http://127.0.0.1:${port}/api/remote-inbox`, { method: "PUT", headers: apiHeaders, body: JSON.stringify({ content: "x".repeat(101 * 1024), revision: 4 }) })).resolves.toMatchObject({ status: 413 });
+      const cleared = await fetch(`http://127.0.0.1:${port}/api/remote-inbox`, { method: "DELETE", headers: apiHeaders, body: JSON.stringify({ revision: 4 }) });
+      await expect(cleared.json()).resolves.toMatchObject({ ok: true, content: "", revision: 5 });
+      const tabs = await fetch(`http://127.0.0.1:${port}/api/tabs`, { headers: { "Cf-Access-Jwt-Assertion": "test" } });
+      await expect(tabs.json()).resolves.toMatchObject({ tabs: [{ id: "tab-normal", title: "通常タブ" }] });
+      (server as unknown as { rateLimits: Map<string, number[]> }).rateLimits.clear();
+      const normal = await fetch(`http://127.0.0.1:${port}/api/tabs/tab-normal`, { headers: { "Cf-Access-Jwt-Assertion": "test" } });
+      await expect(normal.json()).resolves.toMatchObject({ id: "tab-normal", content: "閲覧専用" });
+      await expect(fetch(`http://127.0.0.1:${port}/api/tabs/tab-missing`, { headers: { "Cf-Access-Jwt-Assertion": "test" } })).resolves.toMatchObject({ status: 404 });
+      await expect(fetch(`http://127.0.0.1:${port}/api/tabs/..%2Fsecret`, { headers: { "Cf-Access-Jwt-Assertion": "test" } })).resolves.toMatchObject({ status: 400 });
+      await expect(fetch(`http://127.0.0.1:${port}/api/tabs`)).resolves.toMatchObject({ status: 401 });
+      (server as unknown as { verify: () => Promise<string> }).verify = async () => { throw new Error("email"); };
+      await expect(fetch(`http://127.0.0.1:${port}/api/tabs`, { headers: { "Cf-Access-Jwt-Assertion": "test" } })).resolves.toMatchObject({ status: 403 });
     } finally {
       await server.stop();
     }
   });
 
   test("Remote Inbox creates the selected tab and timestamps without a blank line", async ({}, testInfo) => {
-    const { app, dataDir } = await launchTextEditor(testInfo);
+    const { app, page, dataDir } = await launchTextEditor(testInfo);
     try {
-      await app.evaluate(({ BrowserWindow }) => {
-        BrowserWindow.getAllWindows()[0]?.webContents.send("remote-inbox:append-request", { id: "remote-inbox-test", text: "1件目のメモ", includeTimestamp: true, targetTabName: "買い物メモ" });
-      });
-      await expect.poll(async () => (await readIndex(dataDir)).tabs.some((tab) => tab.title === "買い物メモ")).toBe(true);
+      await expect(page.locator("#save-state")).toHaveAttribute("data-mode", "idle");
+      const appendResult = await app.evaluate(async ({ BrowserWindow, ipcMain }) => new Promise<{ ok?: boolean; error?: string }>((resolve) => {
+        ipcMain.once("remote-inbox:append-result", (_event, payload) => resolve(payload as { ok?: boolean; error?: string }));
+        BrowserWindow.getAllWindows()[0]?.webContents.send("remote-inbox:append-request", { id: "remote-inbox-test", text: "1件目のメモ", includeTimestamp: true, targetTabName: "Remote Inbox" });
+      }));
+      expect(appendResult).toMatchObject({ ok: true });
+      await expect.poll(async () => (await readIndex(dataDir)).tabs.some((tab) => tab.title === "Remote Inbox")).toBe(true);
       const index = await readIndex(dataDir);
-      const target = index.tabs.find((tab) => tab.title === "買い物メモ");
+      const target = index.tabs.find((tab) => tab.title === "Remote Inbox");
       expect(target?.pinned).toBe(true);
       const tab = await readTab(dataDir, target!.id);
       expect(tab.content).toMatch(/^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}\]\n1件目のメモ$/);
+      expect(tab.revision).toBe(1);
+      await pressShortcut(page, "Control+Shift+F");
+      await page.locator("#global-search-input").fill("1件目のメモ");
+      await expect(page.locator(".search-result-row")).toHaveCount(1);
+      await page.locator(".search-result-row").click();
+      await expect(page.locator("#left-editor-host .cm-content")).toHaveAttribute("contenteditable", "false");
+      await page.locator("#left-editor-host .cm-content").click();
+      await page.keyboard.insertText("PCからの変更");
+      await expect.poll(async () => (await readTab(dataDir, target!.id)).content).toBe(tab.content);
+      await pressShortcut(page, "Control+Shift+C");
+      await expect(page.locator("#save-state")).toContainText("Copied");
+      page.once("dialog", (dialog) => void dialog.accept());
+      await page.locator(`.tab-row[data-id="${target!.id}"]`).click({ button: "right" });
+      await page.getByRole("button", { name: "Clear Remote Inbox" }).click();
+      await expect.poll(async () => (await readTab(dataDir, target!.id)).content).toBe("");
+      await expect.poll(async () => (await readTab(dataDir, target!.id)).revision).toBe(2);
     } finally {
       await closeApp(app);
     }

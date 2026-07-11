@@ -13,6 +13,10 @@ Remote Inbox accepts notes only while Text Editor is running. It listens on `127
 
 Cloudflare Access remains responsible for the Google sign-in. Text Editor validates the signed `Cf-Access-Jwt-Assertion` itself (RS256 signature, issuer, audience, expiration/not-before, and exact lower-cased email match). It does not request Google Drive, Gmail, Calendar, or OAuth client-secret access.
 
+The remote page has **Remote Inbox** and **Tab viewing** modes. Remote Inbox mode can load, replace, append, copy, reload, and clear configured inbox targets. Full saves use a revision number and return HTTP 409 instead of overwriting content changed by another browser or by the PC clear action. On the PC those inbox targets are CodeMirror read-only documents; selection, copying, and the confirmed inbox-only clear action remain available.
+
+Tab viewing mode exposes only normal tabs explicitly selected in Settings > Remote writing. It supports viewing, copying, reloading, and searching, but has no mutation API. Remote Inbox targets are excluded from that list. All read and mutation APIs require the same Cloudflare Access assertion and allowed-email validation; mutations also require CSRF validation. Reads, replacements, clears, tab-list reads, and tab-content reads are audited without storing note content.
+
 The workspace export includes the Remote Inbox Team Domain, AUD, and allowed email because these are workspace settings. It never includes JWTs, cookies, or submitted note content. Keep exported workspace archives private.
 
 `cloudflared` is deliberately not installed or launched by Text Editor. Follow Cloudflare's current documentation if you want to run the tunnel as a Windows service.
