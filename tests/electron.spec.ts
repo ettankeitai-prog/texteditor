@@ -855,4 +855,31 @@ test.describe("Text Editor Electron MVP", () => {
       await closeApp(relaunched.app);
     }
   });
+
+  test("persists Remote Inbox settings with safe defaults", async ({}, testInfo) => {
+    const { app, page, dataDir } = await launchTextEditor(testInfo);
+    try {
+      await app.evaluate(({ BrowserWindow }) => {
+        BrowserWindow.getAllWindows()[0]?.webContents.send("menu:action", "open-settings");
+      });
+      await expect(page.locator('input[name="remote-enabled"]')).not.toBeChecked();
+      await expect(page.locator('input[name="remote-port"]')).toHaveValue("48731");
+      await expect(page.locator('input[name="remote-tab"]')).toHaveValue("Remote Inbox");
+      await page.locator('input[name="remote-tab"]').fill("Phone Inbox");
+      await page.locator('input[name="remote-domain"]').fill("https://team.cloudflareaccess.com");
+      await page.locator('input[name="remote-audience"]').fill("audience-tag");
+      await page.locator('input[name="remote-email"]').fill("me@example.com");
+      await page.locator(".settings-dialog").getByRole("button", { name: "OK" }).click();
+      await expect.poll(async () => (await readWorkspace(dataDir)).remoteInbox).toMatchObject({
+        enabled: false,
+        port: 48731,
+        targetTabName: "Phone Inbox",
+        accessTeamDomain: "https://team.cloudflareaccess.com",
+        accessAudience: "audience-tag",
+        allowedEmail: "me@example.com"
+      });
+    } finally {
+      await closeApp(app);
+    }
+  });
 });

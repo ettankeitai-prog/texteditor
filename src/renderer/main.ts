@@ -1954,6 +1954,16 @@ function openSettingsDialog(): void {
         <input type="checkbox" name="auto-continue-lists" ${workspace.autoContinueLists ? "checked" : ""} />
         <span>${escapeHtml(label.autoContinueLists)}</span>
       </label>
+      <div class="settings-section-title">${workspace.locale === "jp" ? "遠隔書き込み" : "Remote writing"}</div>
+      <label class="settings-check"><input type="checkbox" name="remote-enabled" ${workspace.remoteInbox.enabled ? "checked" : ""} /><span>${workspace.locale === "jp" ? "遠隔書き込みを有効にする" : "Enable remote writing"}</span></label>
+      <label class="settings-field">${workspace.locale === "jp" ? "ローカル待受ポート" : "Local listening port"}<input name="remote-port" type="number" min="1024" max="65535" value="${workspace.remoteInbox.port}" /></label>
+      <label class="settings-field">${workspace.locale === "jp" ? "受信先タブ名" : "Target tab name"}<input name="remote-tab" value="${escapeHtml(workspace.remoteInbox.targetTabName)}" /></label>
+      <label class="settings-check"><input type="checkbox" name="remote-timestamp" ${workspace.remoteInbox.includeTimestamp ? "checked" : ""} /><span>${workspace.locale === "jp" ? "受信日時を付ける" : "Include received timestamp"}</span></label>
+      <label class="settings-check"><input type="checkbox" name="remote-notify" ${workspace.remoteInbox.notifyOnReceive ? "checked" : ""} /><span>${workspace.locale === "jp" ? "受信時にデスクトップ通知する" : "Show desktop notification"}</span></label>
+      <label class="settings-field">Cloudflare Access Team Domain<input name="remote-domain" type="url" placeholder="https://example.cloudflareaccess.com" value="${escapeHtml(workspace.remoteInbox.accessTeamDomain)}" /></label>
+      <label class="settings-field">Cloudflare Access Application AUD<input name="remote-audience" value="${escapeHtml(workspace.remoteInbox.accessAudience)}" /></label>
+      <label class="settings-field">${workspace.locale === "jp" ? "許可メールアドレス" : "Allowed email address"}<input name="remote-email" type="email" value="${escapeHtml(workspace.remoteInbox.allowedEmail)}" /></label>
+      <p class="dialog-note" id="remote-status"></p>
       <div class="dialog-actions">
         <button type="button" data-dialog-action="cancel">${label.cancel}</button>
         <button type="submit" data-dialog-action="ok">${label.ok}</button>
@@ -1976,12 +1986,22 @@ function openSettingsDialog(): void {
     overlay.remove();
     openCustomTemplateEditor();
   });
+  void window.textEditor.remoteInboxStatus().then((status) => {
+    const statusElement = overlay.querySelector("#remote-status");
+    if (statusElement) statusElement.textContent = status.state === "running" ? `${workspace.locale === "jp" ? "起動中" : "Running"}: ${status.url}` : status.state === "error" ? `${workspace.locale === "jp" ? "エラー" : "Error"}: ${status.message}` : (workspace.locale === "jp" ? "停止中" : "Stopped");
+  });
   overlay.querySelector<HTMLButtonElement>('[data-dialog-action="cancel"]')!.addEventListener("click", () => overlay.remove());
   overlay.querySelector<HTMLFormElement>("form")!.addEventListener("submit", (event) => {
     event.preventDefault();
     const value = new FormData(event.currentTarget as HTMLFormElement).get("new-tab-template");
     workspace.newTabTemplate = value === "novel" || value === "reference" || value === "custom" ? value : "simple";
     workspace.autoContinueLists = Boolean((event.currentTarget as HTMLFormElement).querySelector<HTMLInputElement>('input[name="auto-continue-lists"]')?.checked);
+    const form = event.currentTarget as HTMLFormElement;
+    const port = Number(form.querySelector<HTMLInputElement>('input[name="remote-port"]')?.value);
+    const targetTabName = form.querySelector<HTMLInputElement>('input[name="remote-tab"]')?.value.trim() ?? "";
+    const accessTeamDomain = form.querySelector<HTMLInputElement>('input[name="remote-domain"]')?.value.trim() ?? "";
+    if (!Number.isInteger(port) || port < 1024 || port > 65535 || !targetTabName) { setSaveState(workspace.locale === "jp" ? "遠隔書き込みの設定が不正です" : "Remote writing settings are invalid", "error"); return; }
+    workspace.remoteInbox = { enabled: Boolean(form.querySelector<HTMLInputElement>('input[name="remote-enabled"]')?.checked), port, targetTabName, includeTimestamp: Boolean(form.querySelector<HTMLInputElement>('input[name="remote-timestamp"]')?.checked), notifyOnReceive: Boolean(form.querySelector<HTMLInputElement>('input[name="remote-notify"]')?.checked), accessTeamDomain, accessAudience: form.querySelector<HTMLInputElement>('input[name="remote-audience"]')?.value.trim() ?? "", allowedEmail: form.querySelector<HTMLInputElement>('input[name="remote-email"]')?.value.trim() ?? "" };
     workspace.templates = {
       ...workspace.templates,
       custom: [MAIN_CHILD_TAB_TITLE, ...normalizeTemplateTitles(workspace.templates?.custom).slice(1)]
@@ -3473,6 +3493,58 @@ window.addEventListener("beforeunload", () => {
   syncActiveTabId();
   void window.textEditor.saveWorkspace(workspace);
 });
+
+function remoteTimestamp(): string {
+  const date = new Date();
+  const pad = (value: number): string => String(value).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+async function appendRemoteInbox(textValue: string, includeTimestamp: boolean, targetTabName: string): Promise<void> {
+  const title = targetTabName.trim();
+  let meta = tabIndex.tabs.find((entry) => entry.title === title);
+  let tab: TabDocument;
+  if (meta) {
+    tab = await loadTabToCache(meta.id);
+  } else {
+    const id = nextTabId();
+    const updatedAt = nowIso();
+    tab = ensureTab({ id, title, content: "", activeChildTabId: MAIN_CHILD_TAB_ID, childTabs: [{ id: MAIN_CHILD_TAB_ID, title: localizedMainChildTitle(), content: "", updatedAt }], updatedAt });
+    contentCache.set(id, tab);
+    updateMetaFromDocument(tab);
+    tabIndex = normalizeTabsIndex({
+      ...tabIndex,
+      tabs: tabIndex.tabs.map((entry) => (entry.id === id ? { ...entry, pinned: true } : entry))
+    });
+    tabIndex = insertTabIntoIndexGroup(tabIndex, id, null);
+    await saveTabsIndex();
+    meta = tabIndex.tabs.find((entry) => entry.id === id);
+  }
+  const main = getMainChildTab(tab);
+  const entry = includeTimestamp ? `[${remoteTimestamp()}]\n\n${textValue}` : textValue;
+  const content = main.content ? `${main.content}\n\n${entry}` : entry;
+  const updated = setChildContent(tab, MAIN_CHILD_TAB_ID, content);
+  updated.updatedAt = nowIso();
+  contentCache.set(updated.id, updated);
+  updateMetaFromDocument(updated);
+  for (const pane of Object.values(panes) as EditorPaneState[]) {
+    if (pane.activeTabId !== updated.id || pane.activeChildTabId !== MAIN_CHILD_TAB_ID || !pane.view) continue;
+    pane.programmaticChange = true;
+    pane.view.dispatch({ changes: { from: pane.view.state.doc.length, insert: `${pane.view.state.doc.length ? "\n\n" : ""}${entry}` }, annotations: Transaction.addToHistory.of(false) });
+    pane.programmaticChange = false;
+    cachePaneEditorState(pane);
+  }
+  const saved = ensureTab(await window.textEditor.saveTab(updated));
+  const latest = contentCache.get(updated.id);
+  if (latest && latest.updatedAt !== updated.updatedAt) return;
+  contentCache.set(saved.id, saved);
+  updateMetaFromDocument(saved);
+  dirtyTabIds.delete(saved.id);
+  renderSidebar();
+  updateStatus();
+}
+
+window.textEditor.onRemoteInboxAppend(async (request) => appendRemoteInbox(request.text, request.includeTimestamp, request.targetTabName));
 
 async function bootstrap(): Promise<void> {
   createEditor(panes.left);

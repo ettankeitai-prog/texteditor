@@ -783,6 +783,24 @@ body.is-split-resizing {
   font-size: 12px;
 }
 
+.settings-field {
+  display: grid;
+  gap: 6px;
+  margin: 10px 0;
+  color: var(--text);
+  font-size: 13px;
+}
+
+.settings-field input {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 8px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--input-bg);
+  color: var(--text);
+}
+
 .modal-list {
   display: grid;
   gap: 4px;
