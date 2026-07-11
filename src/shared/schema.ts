@@ -8,6 +8,17 @@ export interface WorkspaceTemplates {
   custom: string[];
 }
 
+export interface RemoteInboxSettings {
+  enabled: boolean;
+  port: number;
+  targetTabName: string;
+  includeTimestamp: boolean;
+  notifyOnReceive: boolean;
+  accessTeamDomain: string;
+  accessAudience: string;
+  allowedEmail: string;
+}
+
 export interface WorkspacePaneState {
   id: PaneId;
   activeTabId: string | null;
@@ -34,6 +45,7 @@ export interface WorkspaceState {
   newTabTemplate: NewTabTemplateId;
   templates: WorkspaceTemplates;
   layout: WorkspaceLayout;
+  remoteInbox: RemoteInboxSettings;
 }
 
 export interface TabMeta {
@@ -154,6 +166,16 @@ export const defaultWorkspace: WorkspaceState = {
   newTabTemplate: "simple",
   templates: {
     custom: [MAIN_CHILD_TAB_TITLE]
+  },
+  remoteInbox: {
+    enabled: false,
+    port: 48731,
+    targetTabName: "Remote Inbox",
+    includeTimestamp: true,
+    notifyOnReceive: true,
+    accessTeamDomain: "",
+    accessAudience: "",
+    allowedEmail: ""
   },
   layout: {
     splitMode: "single",

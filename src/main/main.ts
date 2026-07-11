@@ -1,5 +1,5 @@
 import AdmZip from "adm-zip";
-import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu } from "electron";
+import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, Notification } from "electron";
 import type { OpenDialogOptions } from "electron";
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { cp, mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
@@ -29,6 +29,7 @@ import {
   normalizeTabDocument,
   normalizeTabsIndex
 } from "../shared/schema.js";
+import { RemoteInboxServer, type RemoteInboxStatus } from "./remoteInbox.js";
 
 type MenuAction =
   | "new-tab"
@@ -63,6 +64,9 @@ app.setName("texteditor");
 
 let currentLocale: Locale = "en";
 let startupRecoveryState: RecoveryState = { abnormalShutdown: false };
+let remoteInboxStatus: RemoteInboxStatus = { state: "stopped" };
+let remoteInboxSettings = defaultWorkspace.remoteInbox;
+const pendingRemoteAppends = new Map<string, { resolve: (value: { ok: boolean; error?: string }) => void; timer: NodeJS.Timeout }>();
 
 const menuLabels: Record<
   Locale,
@@ -174,6 +178,14 @@ if (process.env.TEXTEDITOR_USER_DATA) {
 
 function dataRoot(): string {
   return path.join(app.getPath("userData"), "data");
+}
+
+function localIsoWithOffset(date = new Date()): string {
+  const pad = (value: number): string => String(value).padStart(2, "0");
+  const offset = -date.getTimezoneOffset();
+  const sign = offset >= 0 ? "+" : "-";
+  const absolute = Math.abs(offset);
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}${sign}${pad(Math.floor(absolute / 60))}:${pad(absolute % 60)}`;
 }
 
 function workspacePath(): string {
@@ -332,6 +344,18 @@ function normalizeWorkspace(input: Partial<WorkspaceState>): WorkspaceState {
       ...defaultWorkspace.templates,
       ...(input.templates && typeof input.templates === "object" ? input.templates : {}),
       custom: normalizeCustomTemplate(input.templates?.custom)
+    },
+    remoteInbox: {
+      ...defaultWorkspace.remoteInbox,
+      ...(input.remoteInbox && typeof input.remoteInbox === "object" ? input.remoteInbox : {}),
+      enabled: Boolean(input.remoteInbox?.enabled),
+      port: Number.isInteger(input.remoteInbox?.port) && (input.remoteInbox?.port ?? 0) >= 1024 && (input.remoteInbox?.port ?? 0) <= 65535 ? input.remoteInbox!.port : defaultWorkspace.remoteInbox.port,
+      targetTabName: typeof input.remoteInbox?.targetTabName === "string" && input.remoteInbox.targetTabName.trim() ? input.remoteInbox.targetTabName.trim().slice(0, 120) : defaultWorkspace.remoteInbox.targetTabName,
+      includeTimestamp: input.remoteInbox?.includeTimestamp !== false,
+      notifyOnReceive: input.remoteInbox?.notifyOnReceive !== false,
+      accessTeamDomain: typeof input.remoteInbox?.accessTeamDomain === "string" ? input.remoteInbox.accessTeamDomain.trim() : "",
+      accessAudience: typeof input.remoteInbox?.accessAudience === "string" ? input.remoteInbox.accessAudience.trim() : "",
+      allowedEmail: typeof input.remoteInbox?.allowedEmail === "string" ? input.remoteInbox.allowedEmail.trim() : ""
     },
     layout: normalizedLayout
   };
@@ -778,9 +802,30 @@ function buildApplicationMenu(): Menu {
   ]);
 }
 
+const remoteInboxServer = new RemoteInboxServer({
+  dataRoot,
+  getSettings: () => remoteInboxSettings,
+  onStatus: (status) => { remoteInboxStatus = status; },
+  append: async (text, includeTimestamp, targetTabName) => {
+    const window = BrowserWindow.getAllWindows()[0];
+    if (!window || window.isDestroyed() || window.webContents.isDestroyed()) return { ok: false, error: "Renderer unavailable" };
+    const id = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const result = await new Promise<{ ok: boolean; error?: string }>((resolve) => {
+      const timer = setTimeout(() => { pendingRemoteAppends.delete(id); resolve({ ok: false, error: "Renderer timeout" }); }, 10_000);
+      pendingRemoteAppends.set(id, { resolve, timer });
+      window.webContents.send("remote-inbox:append-request", { id, text, includeTimestamp, targetTabName });
+    });
+    if (result.ok && (await loadWorkspace()).remoteInbox.notifyOnReceive && Notification.isSupported()) {
+      try { new Notification({ title: "Remote memo received", body: `${targetTabName} was updated.` }).show(); } catch { /* notification does not affect save */ }
+    }
+    return result.ok ? { ok: true, receivedAt: localIsoWithOffset() } : { ok: false, error: result.error ?? "Save failed" };
+  }
+});
+
 ipcMain.handle("app:load", async (): Promise<AppStateSnapshot> => {
   await ensureDataFiles();
   const workspace = await loadWorkspace();
+  remoteInboxSettings = workspace.remoteInbox;
   const tabIndex = await loadIndex();
   await createStartupBackups(workspace, tabIndex);
   return {
@@ -808,11 +853,23 @@ ipcMain.handle("app:quit", async (): Promise<void> => {
 ipcMain.handle("workspace:save", async (_event, workspace: WorkspaceState): Promise<WorkspaceState> => {
   const normalized = normalizeWorkspace(workspace);
   await writeJson(workspacePath(), normalized);
+  remoteInboxSettings = normalized.remoteInbox;
   if (currentLocale !== normalized.locale) {
     currentLocale = normalized.locale;
     Menu.setApplicationMenu(buildApplicationMenu());
   }
+  await remoteInboxServer.configure();
   return normalized;
+});
+
+ipcMain.handle("remote-inbox:status", async (): Promise<RemoteInboxStatus> => remoteInboxStatus);
+ipcMain.on("remote-inbox:append-result", (_event, payload: { id?: string; ok?: boolean; error?: string }) => {
+  if (typeof payload?.id !== "string") return;
+  const pending = pendingRemoteAppends.get(payload.id);
+  if (!pending) return;
+  clearTimeout(pending.timer);
+  pendingRemoteAppends.delete(payload.id);
+  pending.resolve({ ok: Boolean(payload.ok), error: typeof payload.error === "string" ? payload.error : undefined });
 });
 
 ipcMain.handle("tabs:index:save", async (_event, index: TabsIndex): Promise<TabsIndex> => {
@@ -1127,6 +1184,8 @@ app.whenReady().then(async () => {
   await ensureDataFiles();
   startupRecoveryState = await markSessionStarted();
   currentLocale = (await loadWorkspace()).locale;
+  remoteInboxSettings = (await loadWorkspace()).remoteInbox;
+  await remoteInboxServer.configure();
   Menu.setApplicationMenu(buildApplicationMenu());
   createWindow();
   app.on("activate", () => {
@@ -1137,6 +1196,7 @@ app.whenReady().then(async () => {
 });
 
 app.on("will-quit", () => {
+  void remoteInboxServer.stop();
   markSessionCleanSync();
 });
 

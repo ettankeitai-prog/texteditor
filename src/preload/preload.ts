@@ -71,6 +71,14 @@ const api = {
     return result;
   },
   writeClipboardText: (text: string): Promise<void> => ipcRenderer.invoke("clipboard:writeText", text),
+  remoteInboxStatus: (): Promise<{ state: "stopped" | "running" | "error"; message?: string; url?: string }> => ipcRenderer.invoke("remote-inbox:status"),
+  onRemoteInboxAppend: (callback: (request: { id: string; text: string; includeTimestamp: boolean; targetTabName: string }) => Promise<void>): (() => void) => {
+    const listener = (_event: Electron.IpcRendererEvent, request: { id: string; text: string; includeTimestamp: boolean; targetTabName: string }): void => {
+      void callback(request).then(() => ipcRenderer.send("remote-inbox:append-result", { id: request.id, ok: true }), (error: unknown) => ipcRenderer.send("remote-inbox:append-result", { id: request.id, ok: false, error: error instanceof Error ? error.message : "Save failed" }));
+    };
+    ipcRenderer.on("remote-inbox:append-request", listener);
+    return () => ipcRenderer.removeListener("remote-inbox:append-request", listener);
+  },
   onMenuAction: (callback: (action: MenuAction) => void): (() => void) => {
     const listener = (_event: Electron.IpcRendererEvent, action: MenuAction): void => callback(action);
     ipcRenderer.on("menu:action", listener);
