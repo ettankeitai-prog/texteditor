@@ -1958,6 +1958,7 @@ function openSettingsDialog(): void {
       <label class="settings-check"><input type="checkbox" name="remote-enabled" ${workspace.remoteInbox.enabled ? "checked" : ""} /><span>${workspace.locale === "jp" ? "遠隔書き込みを有効にする" : "Enable remote writing"}</span></label>
       <label class="settings-field">${workspace.locale === "jp" ? "ローカル待受ポート" : "Local listening port"}<input name="remote-port" type="number" min="1024" max="65535" value="${workspace.remoteInbox.port}" /></label>
       <label class="settings-field">${workspace.locale === "jp" ? "受信先タブ名" : "Target tab name"}<input name="remote-tab" value="${escapeHtml(workspace.remoteInbox.targetTabName)}" /></label>
+      <label class="settings-field">${workspace.locale === "jp" ? "受信先候補（1行に1件）" : "Target choices (one per line)"}<textarea name="remote-targets" rows="4">${escapeHtml(workspace.remoteInbox.targetTabNames.join("\n"))}</textarea></label>
       <label class="settings-check"><input type="checkbox" name="remote-timestamp" ${workspace.remoteInbox.includeTimestamp ? "checked" : ""} /><span>${workspace.locale === "jp" ? "受信日時を付ける" : "Include received timestamp"}</span></label>
       <label class="settings-check"><input type="checkbox" name="remote-notify" ${workspace.remoteInbox.notifyOnReceive ? "checked" : ""} /><span>${workspace.locale === "jp" ? "受信時にデスクトップ通知する" : "Show desktop notification"}</span></label>
       <label class="settings-field">Cloudflare Access Team Domain<input name="remote-domain" type="url" placeholder="https://example.cloudflareaccess.com" value="${escapeHtml(workspace.remoteInbox.accessTeamDomain)}" /></label>
@@ -1999,9 +2000,10 @@ function openSettingsDialog(): void {
     const form = event.currentTarget as HTMLFormElement;
     const port = Number(form.querySelector<HTMLInputElement>('input[name="remote-port"]')?.value);
     const targetTabName = form.querySelector<HTMLInputElement>('input[name="remote-tab"]')?.value.trim() ?? "";
+    const targetTabNames = (form.querySelector<HTMLTextAreaElement>('textarea[name="remote-targets"]')?.value ?? "").split(/\r?\n/).map((name) => name.trim()).filter((name, index, names) => Boolean(name) && name.length <= 120 && !/[\u0000-\u001F\u007F]/.test(name) && names.indexOf(name) === index).slice(0, 30);
     const accessTeamDomain = form.querySelector<HTMLInputElement>('input[name="remote-domain"]')?.value.trim() ?? "";
-    if (!Number.isInteger(port) || port < 1024 || port > 65535 || !targetTabName) { setSaveState(workspace.locale === "jp" ? "遠隔書き込みの設定が不正です" : "Remote writing settings are invalid", "error"); return; }
-    workspace.remoteInbox = { enabled: Boolean(form.querySelector<HTMLInputElement>('input[name="remote-enabled"]')?.checked), port, targetTabName, includeTimestamp: Boolean(form.querySelector<HTMLInputElement>('input[name="remote-timestamp"]')?.checked), notifyOnReceive: Boolean(form.querySelector<HTMLInputElement>('input[name="remote-notify"]')?.checked), accessTeamDomain, accessAudience: form.querySelector<HTMLInputElement>('input[name="remote-audience"]')?.value.trim() ?? "", allowedEmail: form.querySelector<HTMLInputElement>('input[name="remote-email"]')?.value.trim() ?? "" };
+    if (!Number.isInteger(port) || port < 1024 || port > 65535 || !targetTabName || targetTabName.length > 120 || /[\u0000-\u001F\u007F]/.test(targetTabName) || !targetTabNames.length) { setSaveState(workspace.locale === "jp" ? "遠隔書き込みの設定が不正です" : "Remote writing settings are invalid", "error"); return; }
+    workspace.remoteInbox = { enabled: Boolean(form.querySelector<HTMLInputElement>('input[name="remote-enabled"]')?.checked), port, targetTabName, targetTabNames, includeTimestamp: Boolean(form.querySelector<HTMLInputElement>('input[name="remote-timestamp"]')?.checked), notifyOnReceive: Boolean(form.querySelector<HTMLInputElement>('input[name="remote-notify"]')?.checked), accessTeamDomain, accessAudience: form.querySelector<HTMLInputElement>('input[name="remote-audience"]')?.value.trim() ?? "", allowedEmail: form.querySelector<HTMLInputElement>('input[name="remote-email"]')?.value.trim() ?? "" };
     workspace.templates = {
       ...workspace.templates,
       custom: [MAIN_CHILD_TAB_TITLE, ...normalizeTemplateTitles(workspace.templates?.custom).slice(1)]
@@ -3521,7 +3523,7 @@ async function appendRemoteInbox(textValue: string, includeTimestamp: boolean, t
     meta = tabIndex.tabs.find((entry) => entry.id === id);
   }
   const main = getMainChildTab(tab);
-  const entry = includeTimestamp ? `[${remoteTimestamp()}]\n\n${textValue}` : textValue;
+  const entry = includeTimestamp ? `[${remoteTimestamp()}]\n${textValue}` : textValue;
   const content = main.content ? `${main.content}\n\n${entry}` : entry;
   const updated = setChildContent(tab, MAIN_CHILD_TAB_ID, content);
   updated.updatedAt = nowIso();

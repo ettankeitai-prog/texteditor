@@ -94,7 +94,7 @@ export class RemoteInboxServer {
     this.csrfTokens.set(token, Date.now() + 30 * 60_000);
     response.setHeader("Set-Cookie", `remoteInboxCsrf=${token}; Path=/; HttpOnly; SameSite=Strict; Secure; Max-Age=1800`);
     response.setHeader("Content-Type", "text/html; charset=utf-8");
-    response.end(formHtml(token));
+    response.end(formHtml(token, targetNames(this.options.getSettings())));
   }
 
   private async append(request: IncomingMessage, response: ServerResponse): Promise<void> {
@@ -115,12 +115,16 @@ export class RemoteInboxServer {
     }
     if (!payload || typeof payload !== "object" || typeof (payload as { text?: unknown }).text !== "string" || !(payload as { text: string }).text.trim()) return json(response, 400, { ok: false, error: "Text is required" });
     const text = (payload as { text: string }).text;
+    const requestedTarget = (payload as { target?: unknown }).target;
+    const targets = targetNames(settings);
+    const targetTabName = requestedTarget === undefined ? settings.targetTabName : typeof requestedTarget === "string" && isValidTargetName(requestedTarget) && targets.includes(requestedTarget) ? requestedTarget : "";
     const assertion = request.headers["cf-access-jwt-assertion"];
     if (typeof assertion !== "string") { await this.audit("failure", undefined, Buffer.byteLength(text), "auth"); return json(response, 401, { ok: false, error: "Authentication required" }); }
     let email: string;
     try { email = await this.verify(assertion, settings); } catch { await this.audit("failure", undefined, Buffer.byteLength(text), "jwt"); return json(response, 403, { ok: false, error: "Authentication rejected" }); }
+    if (!targetTabName) { await this.audit("failure", email, Buffer.byteLength(text), "target"); return json(response, 400, { ok: false, error: "Invalid target" }); }
     if (!this.allow(email)) { await this.audit("failure", email, Buffer.byteLength(text), "rate-limit"); return json(response, 429, { ok: false, error: "Too many requests" }); }
-    const result = await this.options.append(text, settings.includeTimestamp, settings.targetTabName);
+    const result = await this.options.append(text, settings.includeTimestamp, targetTabName);
     await this.audit(result.ok ? "success" : "failure", email, Buffer.byteLength(text), result.ok ? undefined : "save");
     if (!result.ok) return json(response, 500, { ok: false, error: "Could not save note" });
     json(response, 200, result);
@@ -155,9 +159,15 @@ export class RemoteInboxServer {
 }
 
 function validSettings(value: RemoteInboxSettings): boolean {
-  try { const url = new URL(value.accessTeamDomain); return url.protocol === "https:" && Boolean(url.hostname) && Number.isInteger(value.port) && value.port >= 1024 && value.port <= 65535 && Boolean(value.targetTabName.trim()) && Boolean(value.accessAudience.trim()) && /^\S+@\S+\.\S+$/.test(value.allowedEmail.trim()); } catch { return false; }
+  try { const url = new URL(value.accessTeamDomain); return url.protocol === "https:" && Boolean(url.hostname) && Number.isInteger(value.port) && value.port >= 1024 && value.port <= 65535 && isValidTargetName(value.targetTabName) && Boolean(value.accessAudience.trim()) && /^\S+@\S+\.\S+$/.test(value.allowedEmail.trim()); } catch { return false; }
+}
+function isValidTargetName(value: string): boolean { return value === value.trim() && value.length > 0 && value.length <= 120 && !/[\u0000-\u001F\u007F]/.test(value); }
+function targetNames(settings: RemoteInboxSettings): string[] {
+  const names = Array.isArray(settings.targetTabNames) ? settings.targetTabNames.filter(isValidTargetName) : [];
+  return [...new Set(names)].length ? [...new Set(names)] : [settings.targetTabName];
 }
 function readBody(request: IncomingMessage): Promise<string> { return new Promise((resolve, reject) => { let size = 0; const chunks: Buffer[] = []; request.on("data", (chunk: Buffer) => { size += chunk.length; if (size > MAX_BODY_BYTES) { reject(new Error("too-large")); request.destroy(); } else chunks.push(chunk); }); request.on("end", () => resolve(Buffer.concat(chunks).toString("utf8"))); request.on("error", reject); }); }
 function json(response: ServerResponse, status: number, payload: unknown): void { response.statusCode = status; response.setHeader("Content-Type", "application/json; charset=utf-8"); response.end(JSON.stringify(payload)); }
 function securityHeaders(response: ServerResponse): void { response.setHeader("X-Content-Type-Options", "nosniff"); response.setHeader("X-Frame-Options", "DENY"); response.setHeader("Referrer-Policy", "same-origin"); response.setHeader("Content-Security-Policy", "default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'"); }
-function formHtml(token: string): string { return `<!doctype html><html lang="ja"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><title>Text Editor Remote Inbox</title><style>body{margin:0;background:#111;color:#eee;font:17px -apple-system,BlinkMacSystemFont,sans-serif}main{max-width:680px;margin:auto;padding:24px}textarea,button{box-sizing:border-box;width:100%;font:inherit;border-radius:10px}textarea{min-height:48vh;padding:14px;background:#222;color:#fff;border:1px solid #555}button{margin-top:14px;padding:14px;background:#3978d4;color:#fff;border:0;font-weight:700}#status{min-height:1.5em}</style><main><h1>Text Editor</h1><p>遠隔メモを送信</p><textarea id="text" placeholder="メモを入力"></textarea><button id="send">送信</button><p id="status" role="status"></p></main><script>const t=document.querySelector('#text'),b=document.querySelector('#send'),s=document.querySelector('#status'),k='texteditor-remote-draft';t.value=localStorage.getItem(k)||'';t.oninput=()=>localStorage.setItem(k,t.value);b.onclick=async()=>{if(!t.value.trim())return;s.textContent='送信中…';b.disabled=true;try{let r=await fetch('/api/append',{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':'${token}'},body:JSON.stringify({text:t.value})});if(!r.ok)throw 0;t.value='';localStorage.removeItem(k);s.textContent='送信しました。'}catch{s.textContent='送信に失敗しました。入力内容は保持されています。'}finally{b.disabled=false}};</script></html>`; }
+function formHtml(token: string, targets: string[]): string { const options = targets.map((name) => `<option value="${escapeHtml(name)}">${escapeHtml(name)}</option>`).join(""); return `<!doctype html><html lang="ja"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><title>Text Editor Remote Inbox</title><style>*{box-sizing:border-box}body{margin:0;background:#111;color:#eee;font:17px -apple-system,BlinkMacSystemFont,sans-serif;overflow-x:hidden}main{width:100%;max-width:680px;margin:auto;padding:16px}select,textarea,button{display:block;width:100%;font:inherit;border-radius:10px}select,button{min-height:48px}select,textarea{padding:12px;background:#222;color:#fff;border:1px solid #555}textarea{margin-top:14px;min-height:48vh;resize:vertical}button{margin-top:14px;padding:12px;background:#3978d4;color:#fff;border:0;font-weight:700}</style><main><select id="target" aria-label="送信先">${options}</select><textarea id="text" aria-label="メモ入力欄" placeholder="メモを入力"></textarea><button id="send">送信</button></main><script>const g=document.querySelector('#target'),t=document.querySelector('#text'),b=document.querySelector('#send'),k='texteditor-remote-draft';t.value=localStorage.getItem(k)||'';t.oninput=()=>localStorage.setItem(k,t.value);b.onclick=async()=>{if(!t.value.trim())return;b.disabled=true;try{let r=await fetch('/api/append',{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':'${token}'},body:JSON.stringify({target:g.value,text:t.value})});if(!r.ok)throw 0;t.value='';localStorage.removeItem(k)}finally{b.disabled=false}};</script></html>`; }
+function escapeHtml(value: string): string { return value.replace(/[&<>\"']/g, (character) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[character]!); }

@@ -350,7 +350,8 @@ function normalizeWorkspace(input: Partial<WorkspaceState>): WorkspaceState {
       ...(input.remoteInbox && typeof input.remoteInbox === "object" ? input.remoteInbox : {}),
       enabled: Boolean(input.remoteInbox?.enabled),
       port: Number.isInteger(input.remoteInbox?.port) && (input.remoteInbox?.port ?? 0) >= 1024 && (input.remoteInbox?.port ?? 0) <= 65535 ? input.remoteInbox!.port : defaultWorkspace.remoteInbox.port,
-      targetTabName: typeof input.remoteInbox?.targetTabName === "string" && input.remoteInbox.targetTabName.trim() ? input.remoteInbox.targetTabName.trim().slice(0, 120) : defaultWorkspace.remoteInbox.targetTabName,
+      targetTabName: normalizeRemoteInboxTargetName(input.remoteInbox?.targetTabName),
+      targetTabNames: normalizeRemoteInboxTargetNames(input.remoteInbox?.targetTabNames, typeof input.remoteInbox?.targetTabName === "string" ? input.remoteInbox.targetTabName : defaultWorkspace.remoteInbox.targetTabName),
       includeTimestamp: input.remoteInbox?.includeTimestamp !== false,
       notifyOnReceive: input.remoteInbox?.notifyOnReceive !== false,
       accessTeamDomain: typeof input.remoteInbox?.accessTeamDomain === "string" ? input.remoteInbox.accessTeamDomain.trim() : "",
@@ -359,6 +360,21 @@ function normalizeWorkspace(input: Partial<WorkspaceState>): WorkspaceState {
     },
     layout: normalizedLayout
   };
+}
+
+function normalizeRemoteInboxTargetNames(value: unknown, fallback: string): string[] {
+  const names = Array.isArray(value) ? value : [fallback];
+  const normalized = names
+    .filter((name): name is string => typeof name === "string")
+    .map((name) => name.trim())
+    .filter((name) => Boolean(name) && name.length <= 120 && !/[\u0000-\u001F\u007F]/.test(name));
+  return [...new Set(normalized)].slice(0, 30) || [defaultWorkspace.remoteInbox.targetTabName];
+}
+
+function normalizeRemoteInboxTargetName(value: unknown): string {
+  if (typeof value !== "string") return defaultWorkspace.remoteInbox.targetTabName;
+  const name = value.trim();
+  return name && name.length <= 120 && !/[\u0000-\u001F\u007F]/.test(name) ? name : defaultWorkspace.remoteInbox.targetTabName;
 }
 
 async function loadWorkspace(): Promise<WorkspaceState> {

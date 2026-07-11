@@ -866,6 +866,7 @@ test.describe("Text Editor Electron MVP", () => {
       await expect(page.locator('input[name="remote-port"]')).toHaveValue("48731");
       await expect(page.locator('input[name="remote-tab"]')).toHaveValue("Remote Inbox");
       await page.locator('input[name="remote-tab"]').fill("Phone Inbox");
+      await page.locator('textarea[name="remote-targets"]').fill("Phone Inbox\n買い物メモ\n仕事メモ");
       await page.locator('input[name="remote-domain"]').fill("https://team.cloudflareaccess.com");
       await page.locator('input[name="remote-audience"]').fill("audience-tag");
       await page.locator('input[name="remote-email"]').fill("me@example.com");
@@ -874,10 +875,65 @@ test.describe("Text Editor Electron MVP", () => {
         enabled: false,
         port: 48731,
         targetTabName: "Phone Inbox",
+        targetTabNames: ["Phone Inbox", "買い物メモ", "仕事メモ"],
         accessTeamDomain: "https://team.cloudflareaccess.com",
         accessAudience: "audience-tag",
         allowedEmail: "me@example.com"
       });
+    } finally {
+      await closeApp(app);
+    }
+  });
+
+  test("Remote Inbox form is minimal and only accepts configured targets", async ({}, testInfo) => {
+    const { RemoteInboxServer } = await import("../dist/main/remoteInbox.js");
+    const port = 49000 + (process.pid % 1000);
+    const appends: Array<{ text: string; target: string }> = [];
+    const server = new RemoteInboxServer({
+      dataRoot: () => testInfo.outputDir,
+      getSettings: () => ({ enabled: true, port, targetTabName: "Remote Inbox", targetTabNames: ["Remote Inbox", "買い物メモ"], includeTimestamp: true, notifyOnReceive: false, accessTeamDomain: "https://team.cloudflareaccess.com", accessAudience: "audience", allowedEmail: "me@example.com" }),
+      onStatus: () => undefined,
+      append: async (text: string, _includeTimestamp: boolean, target: string) => { appends.push({ text, target }); return { ok: true as const, receivedAt: "2026-07-11T14:10:00+09:00" }; }
+    });
+    (server as unknown as { verify: () => Promise<string> }).verify = async () => "me@example.com";
+    await server.configure();
+    try {
+      const form = await fetch(`http://127.0.0.1:${port}/`);
+      const html = await form.text();
+      expect(html.match(/<(select|textarea|button)\b/g)).toHaveLength(3);
+      expect(html).not.toContain("<h1");
+      expect(html).not.toContain("role=\"status\"");
+      expect(html).toContain('value="買い物メモ"');
+      const cookie = form.headers.get("set-cookie") ?? "";
+      const token = /remoteInboxCsrf=([^;]+)/.exec(cookie)?.[1];
+      expect(token).toBeTruthy();
+      const post = async (body: unknown) => fetch(`http://127.0.0.1:${port}/api/append`, { method: "POST", headers: { Cookie: cookie, "X-CSRF-Token": token!, "Cf-Access-Jwt-Assertion": "test", "Content-Type": "application/json" }, body: JSON.stringify(body) });
+
+      await expect(post({ target: "買い物メモ", text: "牛乳を買う" })).resolves.toMatchObject({ status: 200 });
+      expect(appends.at(-1)).toEqual({ text: "牛乳を買う", target: "買い物メモ" });
+      await expect(post({ target: "存在しないタブ", text: "拒否" })).resolves.toMatchObject({ status: 400 });
+      await expect(post({ target: "", text: "拒否" })).resolves.toMatchObject({ status: 400 });
+      await expect(post({ target: "買い物\nメモ", text: "拒否" })).resolves.toMatchObject({ status: 400 });
+      await expect(post({ target: "a".repeat(121), text: "拒否" })).resolves.toMatchObject({ status: 400 });
+      await expect(post({ text: "旧クライアント" })).resolves.toMatchObject({ status: 200 });
+      expect(appends.at(-1)).toEqual({ text: "旧クライアント", target: "Remote Inbox" });
+    } finally {
+      await server.stop();
+    }
+  });
+
+  test("Remote Inbox creates the selected tab and timestamps without a blank line", async ({}, testInfo) => {
+    const { app, dataDir } = await launchTextEditor(testInfo);
+    try {
+      await app.evaluate(({ BrowserWindow }) => {
+        BrowserWindow.getAllWindows()[0]?.webContents.send("remote-inbox:append-request", { id: "remote-inbox-test", text: "1件目のメモ", includeTimestamp: true, targetTabName: "買い物メモ" });
+      });
+      await expect.poll(async () => (await readIndex(dataDir)).tabs.some((tab) => tab.title === "買い物メモ")).toBe(true);
+      const index = await readIndex(dataDir);
+      const target = index.tabs.find((tab) => tab.title === "買い物メモ");
+      expect(target?.pinned).toBe(true);
+      const tab = await readTab(dataDir, target!.id);
+      expect(tab.content).toMatch(/^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}\]\n1件目のメモ$/);
     } finally {
       await closeApp(app);
     }

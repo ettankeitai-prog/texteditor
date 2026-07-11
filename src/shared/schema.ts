@@ -12,6 +12,7 @@ export interface RemoteInboxSettings {
   enabled: boolean;
   port: number;
   targetTabName: string;
+  targetTabNames: string[];
   includeTimestamp: boolean;
   notifyOnReceive: boolean;
   accessTeamDomain: string;
@@ -171,6 +172,7 @@ export const defaultWorkspace: WorkspaceState = {
     enabled: false,
     port: 48731,
     targetTabName: "Remote Inbox",
+    targetTabNames: ["Remote Inbox"],
     includeTimestamp: true,
     notifyOnReceive: true,
     accessTeamDomain: "",
