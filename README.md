@@ -1,5 +1,9 @@
 # Text Editor
 
+## Remote Inbox (v1.6)
+
+Text Editor can accept short notes from an iPhone through Cloudflare Tunnel and Cloudflare Access, appending them to a dedicated tab. Setup and security notes are in [Remote Inbox setup](docs/remote-inbox-setup.md). Remote Inbox is off by default; its workspace export includes the Team Domain, AUD, and allowed email address, but never tokens or cookies.
+
 Electron + TypeScript + CodeMirror 6 で作成した、シンプルな小説・メモ用テキストエディタです。
 
 ## 起動方法
