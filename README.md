@@ -1,8 +1,14 @@
 # Text Editor
 
-## Remote Inbox (v1.6)
+## Remote Inbox (v1.8)
 
-Text Editor can accept short notes from an iPhone through Cloudflare Tunnel and Cloudflare Access, appending them to a dedicated tab. Setup and security notes are in [Remote Inbox setup](docs/remote-inbox-setup.md). Remote Inbox is off by default; its workspace export includes the Team Domain, AUD, and allowed email address, but never tokens or cookies.
+Text Editor can accept and edit notes from an iPhone through Cloudflare Tunnel and Cloudflare Access. Setup and security notes are in [Remote Inbox setup](docs/remote-inbox-setup.md). Remote Inbox is off by default; its workspace export includes the Team Domain, AUD, and allowed email address, but never tokens or cookies.
+
+- Remote Web: full Remote Inbox editing, append, reload, copy, clear, revision-based conflict detection, and configured normal-tab viewing
+- Normal tabs on Remote Web: viewing, searching, copying, and safe HTTP/HTTPS link opening only
+- PC app: Remote Inbox targets are read-only; selection, copying, and confirmed clearing remain available
+- Remote tab viewing is opt-in: select normal tabs allowed for remote viewing in `View > Settings > Remote writing`
+- All remote reads and mutations require Cloudflare Access authentication; mutations also require CSRF validation
 
 Electron + TypeScript + CodeMirror 6 で作成した、シンプルな小説・メモ用テキストエディタです。
 
@@ -39,8 +45,8 @@ npm run dist
 
 ```text
 dist/
-  Text Editor Setup 1.5.0.exe
-  Text Editor 1.5.0.exe
+  Text Editor Setup 1.8.0.exe
+  Text Editor 1.8.0.exe
 ```
 
 開発中にレンダラーだけ確認する場合:

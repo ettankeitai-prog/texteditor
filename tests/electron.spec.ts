@@ -916,6 +916,9 @@ test.describe("Text Editor Electron MVP", () => {
       expect(html).toContain('id="tabs-mode"');
       expect(html).toContain('id="editor"');
       expect(html).toContain('value="買い物メモ"');
+      const inlineScripts = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)].map((match) => match[1]);
+      expect(inlineScripts.length).toBeGreaterThan(0);
+      inlineScripts.forEach((script) => expect(() => new Function(script)).not.toThrow());
       const cookie = form.headers.get("set-cookie") ?? "";
       const token = /remoteInboxCsrf=([^;]+)/.exec(cookie)?.[1];
       expect(token).toBeTruthy();
