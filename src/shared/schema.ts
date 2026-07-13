@@ -131,6 +131,8 @@ export interface WorkspaceTransferResult {
   canceled: boolean;
   filePath?: string;
   backupPath?: string;
+  restartRequired?: boolean;
+  error?: string;
 }
 
 export interface ImportedTextFile {

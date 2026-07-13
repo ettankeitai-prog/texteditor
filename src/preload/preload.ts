@@ -37,7 +37,11 @@ type MenuAction =
   | "focus-left"
   | "focus-right"
   | "font-up"
-  | "font-down";
+  | "font-down"
+  | "reload-app";
+
+type ShutdownReason = "close" | "quit" | "reload" | "restart";
+type ShutdownResult = { ok: boolean; error?: string };
 
 const api = {
   loadApp: (): Promise<AppStateSnapshot> => ipcRenderer.invoke("app:load"),
@@ -52,7 +56,31 @@ const api = {
   listBackupHistory: (): Promise<BackupMeta[]> => ipcRenderer.invoke("tab:backup:listAll"),
   loadBackup: (id: string, fileName: string): Promise<TabDocument> => ipcRenderer.invoke("tab:backup:load", id, fileName),
   acknowledgeRecovery: (restore: boolean): Promise<void> => ipcRenderer.invoke("app:recovery:ack", restore),
-  quitApp: (): Promise<void> => ipcRenderer.invoke("app:quit"),
+  quitApp: (): Promise<boolean> => ipcRenderer.invoke("app:quit"),
+  reloadApp: (): Promise<boolean> => ipcRenderer.invoke("app:request-reload"),
+  restartApp: (): Promise<boolean> => ipcRenderer.invoke("app:request-restart"),
+  onBeforeClose: (callback: (reason: ShutdownReason) => Promise<ShutdownResult>): (() => void) => {
+    const listener = (_event: Electron.IpcRendererEvent, request: { id?: string; reason?: ShutdownReason }): void => {
+      if (typeof request?.id !== "string" || !request.reason || !["close", "quit", "reload", "restart"].includes(request.reason)) {
+        return;
+      }
+      void callback(request.reason).then(
+        (result) => ipcRenderer.send("app:shutdown-response", {
+          id: request.id,
+          ok: result?.ok === true,
+          error: typeof result?.error === "string" ? result.error : undefined
+        }),
+        (error: unknown) => ipcRenderer.send("app:shutdown-response", {
+          id: request.id,
+          ok: false,
+          error: error instanceof Error ? error.message : "Save failed"
+        })
+      );
+    };
+    ipcRenderer.on("app:shutdown-request", listener);
+    ipcRenderer.send("app:shutdown-handler-ready");
+    return () => ipcRenderer.removeListener("app:shutdown-request", listener);
+  },
   exportTxt: (tab: TabDocument): Promise<{ canceled: boolean; filePath?: string }> =>
     ipcRenderer.invoke("tab:exportTxt", tab),
   exportAllTxt: (): Promise<{ canceled: boolean; filePath?: string }> => ipcRenderer.invoke("tabs:exportAllTxt"),

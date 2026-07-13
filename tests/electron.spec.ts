@@ -24,7 +24,7 @@ const appRoot = path.resolve(__dirname, "..");
 
 async function launchTextEditor(
   testInfo: TestInfo,
-  options: { clean?: boolean; userDataDir?: string; exportAllPath?: string; workspaceExportPath?: string; workspaceImportPath?: string } = {}
+  options: { clean?: boolean; userDataDir?: string; exportAllPath?: string; workspaceExportPath?: string; workspaceImportPath?: string; allowRecoveryPrompt?: boolean } = {}
 ) {
   const userDataDir = options.userDataDir ?? path.join(testInfo.outputDir, "user-data");
   if (options.clean !== false) {
@@ -45,7 +45,14 @@ async function launchTextEditor(
   });
   const page = await app.firstWindow();
   await page.waitForLoadState("domcontentloaded");
-  await expect(page.locator("#active-title-input")).toBeVisible();
+  if (options.allowRecoveryPrompt) {
+    await expect.poll(async () => page.evaluate(() =>
+      document.body.dataset.appReady === "true" || Boolean(document.querySelector('[data-recovery-action="restore"]'))
+    )).toBe(true);
+  } else {
+    await expect.poll(async () => page.evaluate(() => document.body.dataset.appReady)).toBe("true");
+  }
+  await expect(page.locator("#active-title-input:visible, .pane-title-input:visible").first()).toBeVisible();
   await expect(page.locator("#save-state")).not.toContainText("Startup failed");
 
   return { app, page, userDataDir, dataDir: path.join(userDataDir, "data") };
@@ -55,13 +62,19 @@ async function closeApp(app: ElectronApplication) {
   await app.close().catch(() => undefined);
 }
 
+async function terminateApp(app: ElectronApplication) {
+  app.process().kill();
+  await app.close().catch(() => undefined);
+}
+
 async function activeTabId(page: Page): Promise<string> {
-  const meta = await page.locator("#active-meta").innerText();
-  const match = /^tab-[A-Za-z0-9_-]+/.exec(meta);
-  if (!match) {
-    throw new Error(`Active tab id not found in meta: ${meta}`);
-  }
-  return match[0];
+  const metadataId = await page.locator("#active-meta").getAttribute("data-tab-id");
+  if (metadataId) return metadataId;
+
+  const rowId = await page.locator(".tab-row.is-active").first().getAttribute("data-id");
+  if (rowId) return rowId;
+
+  throw new Error("Active tab id was not present in non-visual metadata or the active sidebar row");
 }
 
 async function readTab(dataDir: string, id: string): Promise<TabDocument> {
@@ -77,13 +90,39 @@ async function readIndex(dataDir: string): Promise<TabsIndex> {
 }
 
 async function focusEditor(page: Page) {
-  await page.locator("#left-editor-host .cm-content").click();
+  await page.getByTestId("active-editor-host").focus();
+}
+
+async function focusActiveEditorAtDocumentEnd(page: Page) {
+  const activeHost = page.getByTestId("active-editor-host");
+  await expect(activeHost).toHaveAttribute("id", "left-editor-host");
+  await activeHost.focus();
+  await expect.poll(() => activeHost.evaluate((host) => host.contains(document.activeElement))).toBe(true);
+  await page.keyboard.press(process.platform === "darwin" ? "Meta+ArrowDown" : "Control+End");
 }
 
 async function replaceEditorText(page: Page, text: string) {
   await focusEditor(page);
   await page.keyboard.press(process.platform === "darwin" ? "Meta+A" : "Control+A");
   await page.keyboard.insertText(text);
+}
+
+async function editorText(page: Page, pane: "left" | "right" = "left") {
+  return page.locator(`#${pane}-editor-host .cm-content`).textContent();
+}
+
+async function replacePaneEditorText(page: Page, pane: "left" | "right", text: string) {
+  const content = page.locator(`#${pane}-editor-host .cm-content`);
+  await content.click({ position: { x: 12, y: 12 } });
+  await expect(content).toBeFocused();
+  await page.keyboard.press(process.platform === "darwin" ? "Meta+A" : "Control+A");
+  await page.keyboard.insertText(text);
+  await expect.poll(() => editorText(page, pane)).toBe(text);
+}
+
+async function expectEditorTab(page: Page, pane: "left" | "right", tabId: string, expectedContent: string) {
+  await expect.poll(() => activeTabId(page)).toBe(tabId);
+  await expect.poll(() => editorText(page, pane)).toBe(expectedContent);
 }
 
 async function waitForSavedTab(dataDir: string, id: string, expectedContent: string) {
@@ -94,8 +133,8 @@ async function pressShortcut(page: Page, shortcut: string) {
   await page.keyboard.press(process.platform === "darwin" ? shortcut.replace("Control", "Meta") : shortcut);
 }
 
-async function editorText(page: Page, pane: "left" | "right" = "left") {
-  return page.locator(`#${pane}-editor-host .cm-content`).textContent();
+function visibleChildTabBar(page: Page) {
+  return page.locator("#single-child-tab-bar:visible, #left-child-tab-bar:visible");
 }
 
 async function createGroupFromSidebarBlank(page: Page) {
@@ -107,7 +146,7 @@ async function createGroupFromSidebarBlank(page: Page) {
   await page.getByRole("button", { name: "New Group" }).click();
 }
 
-test.describe("Text Editor Electron MVP", () => {
+test.describe("Text Editor Electron v1.9.0", () => {
   test.describe("undo and redo history", () => {
     test("undoes and redoes basic input", async ({}, testInfo) => {
       const { app, page } = await launchTextEditor(testInfo);
@@ -133,7 +172,7 @@ test.describe("Text Editor Electron MVP", () => {
 
         await pressShortcut(page, "Control+N");
         await expect(page.locator(".tab-row")).toHaveCount(2);
-        await expect(page.locator("#active-title-input")).toHaveValue("Untitled");
+        await expect(page.locator("#active-title-input")).toHaveValue(/^Untitled(?: \d+)?$/);
         const secondId = await activeTabId(page);
         expect(secondId).not.toBe(firstId);
         await page.locator("#active-title-input").fill("Tab B");
@@ -143,6 +182,8 @@ test.describe("Text Editor Electron MVP", () => {
 
         await page.locator(`.tab-row[data-id="${firstId}"]`).click();
         await expect(page.locator("#active-title-input")).toHaveValue("Tab A");
+        await expect.poll(() => editorText(page)).toBe("alpha");
+        await focusEditor(page);
         await expect(page.locator("#left-editor-host .cm-content")).toBeFocused();
         await pressShortcut(page, "Control+Z");
         await expect.poll(() => editorText(page)).toBe("");
@@ -161,7 +202,7 @@ test.describe("Text Editor Electron MVP", () => {
         const id = await activeTabId(page);
         await replaceEditorText(page, "autosaved text");
         await waitForSavedTab(dataDir, id, "autosaved text");
-        await expect(page.locator("#save-state")).toContainText("Saved");
+        await expect(page.locator("#status-left")).toContainText("Saved");
         await pressShortcut(page, "Control+Z");
         await expect.poll(() => editorText(page)).toBe("");
       } finally {
@@ -201,10 +242,12 @@ test.describe("Text Editor Electron MVP", () => {
       try {
         await replaceEditorText(page, "cat cat");
         await pressShortcut(page, "Control+H");
-        const panel = page.locator(".cm-search");
+        const panel = page.locator("#left-editor-host .cm-search");
         await panel.locator('input[name="search"]').fill("cat");
         await panel.locator('input[name="replace"]').fill("dog");
-        await panel.getByRole("button", { name: /replace all/i }).click();
+        const replaceAllButton = panel.locator('button[name="replaceAll"]');
+        await expect(replaceAllButton).toBeVisible();
+        await replaceAllButton.press("Enter");
         await expect.poll(() => editorText(page)).toBe("dog dog");
         await page.keyboard.press("Escape");
         await pressShortcut(page, "Control+Z");
@@ -220,17 +263,17 @@ test.describe("Text Editor Electron MVP", () => {
       const { app, page } = await launchTextEditor(testInfo);
       try {
         await replaceEditorText(page, "main edit");
-        await page.locator("#left-child-tab-bar .child-tab-add").click();
+        await visibleChildTabBar(page).locator(".child-tab-add").click();
         await page.locator(".dialog-input").fill("Memo");
         await page.getByRole("button", { name: "OK" }).click();
         await replaceEditorText(page, "memo edit");
 
-        await page.locator('#left-child-tab-bar [data-child-id="main"]').click();
+        await visibleChildTabBar(page).locator('[data-child-id="main"]').click();
         await focusEditor(page);
         await pressShortcut(page, "Control+Z");
         await expect.poll(() => editorText(page)).toBe("");
 
-        await page.locator('#left-child-tab-bar [data-child-id="memo"]').click();
+        await visibleChildTabBar(page).locator('[data-child-id="memo"]').click();
         await expect.poll(() => editorText(page)).toBe("memo edit");
       } finally {
         await closeApp(app);
@@ -317,7 +360,7 @@ test.describe("Text Editor Electron MVP", () => {
       await expect.poll(async () => (await readTab(dataDir, id)).title).toBe("第一話");
 
       await pressShortcut(page, "Control+Shift+C");
-      await expect(page.locator("#save-state")).toContainText("Copied");
+      await expect(page.locator("#status-left")).toContainText("Copied");
 
       const resizer = page.locator("#sidebar-resizer");
       const box = await resizer.boundingBox();
@@ -341,6 +384,146 @@ test.describe("Text Editor Electron MVP", () => {
       } finally {
         await closeApp(relaunched.app);
       }
+    } finally {
+      await closeApp(app);
+    }
+  });
+
+  test("flushes a pending autosave before the window closes", async ({}, testInfo) => {
+    const first = await launchTextEditor(testInfo);
+    try {
+      const id = await activeTabId(first.page);
+      const content = "close immediately without waiting for the debounce";
+      await replaceEditorText(first.page, content);
+      await closeApp(first.app);
+
+      await expect.poll(async () => (await readTab(first.dataDir, id)).content).toBe(content);
+      const relaunched = await launchTextEditor(testInfo, { clean: false, userDataDir: first.userDataDir });
+      try {
+        await expect.poll(() => editorText(relaunched.page)).toBe(content);
+      } finally {
+        await closeApp(relaunched.app);
+      }
+    } finally {
+      await closeApp(first.app);
+    }
+  });
+
+  test("reports a corrupt JSON index without replacing it with defaults", async ({}, testInfo) => {
+    const initialized = await launchTextEditor(testInfo);
+    try {
+      const indexPath = path.join(initialized.dataDir, "tabs", "index.json");
+      const corruptJson = '{ "tabs": [ this is intentionally invalid';
+      await writeFile(indexPath, corruptJson, "utf8");
+
+      const message = await initialized.page.evaluate(async () => {
+        try {
+          await window.textEditor.searchAllTabs("will-not-run");
+          return "";
+        } catch (error) {
+          return error instanceof Error ? error.message : String(error);
+        }
+      });
+      expect(message).toContain("Failed to read JSON file");
+      await expect.poll(async () => readFile(indexPath, "utf8")).toBe(corruptJson);
+    } finally {
+      await terminateApp(initialized.app);
+    }
+  });
+
+  test("exposes frequent sidebar actions and moves from a selected new title into the editor", async ({}, testInfo) => {
+    const { app, page } = await launchTextEditor(testInfo);
+    try {
+      const sidebarHeader = page.locator(".sidebar-top");
+      await expect(sidebarHeader.locator('[data-action="global-search"]')).toBeVisible();
+      await expect(sidebarHeader.locator('[data-action="new-tab"]')).toBeVisible();
+
+      await sidebarHeader.locator('[data-action="global-search"]').click();
+      await expect(page.locator("#global-search-input")).toBeVisible();
+      await expect(page.locator("#global-search-input")).toBeFocused();
+      await page.locator('[data-action="close-global-search"]').click();
+
+      await sidebarHeader.locator('[data-action="new-tab"]').click();
+      await expect(page.locator(".tab-row")).toHaveCount(2);
+      const title = page.locator("#active-title-input");
+      await expect(title).toBeFocused();
+      await expect.poll(async () => title.evaluate((input) => {
+        const element = input as HTMLInputElement;
+        return element.selectionStart === 0 && element.selectionEnd === element.value.length;
+      })).toBe(true);
+
+      await title.fill("Quick note");
+      await title.press("Enter");
+      await expect(page.locator("#left-editor-host .cm-content")).toBeFocused();
+    } finally {
+      await closeApp(app);
+    }
+  });
+
+  test("shows open and total group counts and useful actions when every tab is closed", async ({}, testInfo) => {
+    const { app, page } = await launchTextEditor(testInfo);
+    try {
+      await page.locator("#active-title-input").fill("Grouped note");
+      await page.locator("#active-title-input").press("Enter");
+      const id = await activeTabId(page);
+
+      await createGroupFromSidebarBlank(page);
+      const newGroup = page.locator(".group-header", { hasText: "New Group" });
+      await newGroup.click({ button: "right" });
+      await page.getByRole("button", { name: "Rename" }).click();
+      await page.locator(".dialog-input").fill("Daily");
+      await page.getByRole("button", { name: "OK" }).click();
+      const group = page.locator(".group-section[data-group-id]", { hasText: "Daily" });
+      await page.locator(`.tab-row[data-id="${id}"]`).dragTo(group.locator(".group-header"));
+      await expect(group.locator(".group-count")).toHaveText("1 / 1");
+
+      await group.locator(`.tab-row[data-id="${id}"]`).click({ button: "right" });
+      await page.getByRole("button", { name: "Close" }).click();
+      await expect(group.locator(".group-count")).toHaveText("0 / 1");
+
+      const emptyState = page.locator(".sidebar-empty-state");
+      await expect(emptyState).toBeVisible();
+      await expect(emptyState.locator('[data-action="new-tab"]')).toBeVisible();
+      await expect(emptyState.locator('[data-action="open-recent"]')).toBeVisible();
+      await emptyState.locator('[data-action="open-recent"]').click();
+      await expect(page.locator(".list-row", { hasText: "Grouped note" })).toBeVisible();
+      await page.keyboard.press("Escape");
+
+      await emptyState.locator('[data-action="new-tab"]').click();
+      await expect(page.locator(".tab-row")).toHaveCount(1);
+      await expect(page.locator("#active-title-input")).toBeFocused();
+    } finally {
+      await closeApp(app);
+    }
+  });
+
+  test("uses a unified single-pane header, compact split headers, and hides internal metadata", async ({}, testInfo) => {
+    const { app, page, dataDir } = await launchTextEditor(testInfo);
+    try {
+      await page.locator("#active-title-input").fill("Header layout");
+      await page.locator("#active-title-input").press("Enter");
+      const id = await activeTabId(page);
+      await replaceEditorText(page, "header test body");
+      await waitForSavedTab(dataDir, id, "header test body");
+
+      await expect(page.locator(".editor-header")).toBeVisible();
+      await expect(page.locator("#single-child-tab-bar")).toBeVisible();
+      await expect(page.locator(".pane-editor-header:visible")).toHaveCount(0);
+      await expect(page.locator("#save-state")).toHaveCSS("clip-path", "inset(50%)");
+      await expect(page.locator("#active-meta")).toBeHidden();
+      await expect(page.locator("#status-left")).toContainText("Saved");
+      await expect(page.locator("#status-right")).not.toContainText("Data:");
+      const visibleText = await page.locator("body").innerText();
+      expect(visibleText).not.toContain(await activeTabId(page));
+      expect(visibleText).not.toContain(dataDir);
+
+      await page.setViewportSize({ width: 840, height: 700 });
+      await expect(page.locator(".minimap-panel")).toBeHidden();
+
+      await pressShortcut(page, "Control+\\");
+      await expect(page.locator(".editor-area")).toHaveClass(/is-split/);
+      await expect(page.locator(".pane-editor-header:visible")).toHaveCount(2);
+      await expect(page.locator("#single-child-tab-bar")).toBeHidden();
     } finally {
       await closeApp(app);
     }
@@ -384,11 +567,11 @@ test.describe("Text Editor Electron MVP", () => {
   test("switches between English and Japanese UI and restores the locale", async ({}, testInfo) => {
     const { app, page, userDataDir, dataDir } = await launchTextEditor(testInfo);
     try {
-      await expect(page.locator(".pane-title")).toHaveText("Tabs");
+      await expect(page.locator(".pane-title")).toHaveText("Open Tabs");
 
       await pressShortcut(page, "Control+Shift+L");
-      await expect(page.locator(".pane-title")).toHaveText("タブ");
-      await expect(page.locator("#save-state")).toContainText("言語を切り替えました");
+      await expect(page.locator(".pane-title")).toHaveText("開いているタブ");
+      await expect(page.locator("#status-left")).toContainText("言語を切り替えました");
 
       await page.locator(".tab-row").first().click({ button: "right" });
       await expect(page.getByRole("button", { name: "名前変更" })).toBeVisible();
@@ -399,8 +582,8 @@ test.describe("Text Editor Electron MVP", () => {
       await closeApp(app);
       const relaunched = await launchTextEditor(testInfo, { clean: false, userDataDir });
       try {
-        await expect(relaunched.page.locator(".pane-title")).toHaveText("タブ");
-        await expect(relaunched.page.locator("#save-state")).toContainText("保存済み");
+        await expect(relaunched.page.locator(".pane-title")).toHaveText("開いているタブ");
+        await expect(relaunched.page.locator("#status-left")).toContainText("保存済み");
       } finally {
         await closeApp(relaunched.app);
       }
@@ -497,18 +680,31 @@ test.describe("Text Editor Electron MVP", () => {
     try {
       const id = await activeTabId(page);
       await replaceEditorText(page, "abc\nxy");
+      await page.keyboard.press(process.platform === "darwin" ? "Meta+ArrowDown" : "Control+End");
       await expect(page.locator("#status-left")).toContainText("6 characters");
       await expect(page.locator("#status-left")).toContainText("Ln 2, Col 3");
 
       await pressShortcut(page, "Control+A");
       await expect(page.locator("#status-left")).toContainText("Selection 6 characters");
 
-      await replaceEditorText(page, "- item");
+      const activeHost = page.getByTestId("active-editor-host");
+      await expect(activeHost).toHaveAttribute("id", "left-editor-host");
+      const activeContent = activeHost.locator(".cm-content:visible").first();
+      await expect(activeContent).toBeFocused();
+      await pressShortcut(page, "Control+A");
+      await page.keyboard.insertText("- item");
+      await focusActiveEditorAtDocumentEnd(page);
       await page.keyboard.press("Enter");
+      await expect.poll(() => activeTabId(page)).toBe(id);
+      await expect(activeContent).toContainText("- item");
       await waitForSavedTab(dataDir, id, "- item\n- ");
 
-      await replaceEditorText(page, "- ");
+      await expect(activeContent).toBeFocused();
+      await pressShortcut(page, "Control+A");
+      await page.keyboard.insertText("- ");
+      await focusActiveEditorAtDocumentEnd(page);
       await page.keyboard.press("Enter");
+      await expectEditorTab(page, "left", id, "");
       await waitForSavedTab(dataDir, id, "");
 
       await closeApp(app);
@@ -518,9 +714,17 @@ test.describe("Text Editor Electron MVP", () => {
       const relaunched = await launchTextEditor(testInfo, { clean: false, userDataDir });
       try {
         const relaunchedId = await activeTabId(relaunched.page);
-        await replaceEditorText(relaunched.page, "* item");
+        const relaunchedActiveHost = relaunched.page.getByTestId("active-editor-host");
+        await expect(relaunchedActiveHost).toHaveAttribute("id", "left-editor-host");
+        const relaunchedContent = relaunchedActiveHost.locator(".cm-content:visible").first();
+        await focusActiveEditorAtDocumentEnd(relaunched.page);
+        await pressShortcut(relaunched.page, "Control+A");
+        await relaunched.page.keyboard.insertText("- item");
+        await focusActiveEditorAtDocumentEnd(relaunched.page);
         await relaunched.page.keyboard.press("Enter");
-        await waitForSavedTab(dataDir, relaunchedId, "* item\n");
+        await expect.poll(() => activeTabId(relaunched.page)).toBe(relaunchedId);
+        await expect(relaunchedContent).toContainText("- item");
+        await waitForSavedTab(dataDir, relaunchedId, "- item\n");
       } finally {
         await closeApp(relaunched.app);
       }
@@ -647,7 +851,7 @@ test.describe("Text Editor Electron MVP", () => {
       "utf8"
     );
 
-    const restored = await launchTextEditor(testInfo, { clean: false, userDataDir: first.userDataDir });
+    const restored = await launchTextEditor(testInfo, { clean: false, userDataDir: first.userDataDir, allowRecoveryPrompt: true });
     try {
       await expect(restored.page.getByText("The app did not shut down normally last time.")).toBeVisible();
       await restored.page.getByRole("button", { name: "Restore" }).click();
@@ -663,13 +867,34 @@ test.describe("Text Editor Electron MVP", () => {
       "utf8"
     );
 
-    const skipped = await launchTextEditor(testInfo, { clean: false, userDataDir: first.userDataDir });
+    const skipped = await launchTextEditor(testInfo, { clean: false, userDataDir: first.userDataDir, allowRecoveryPrompt: true });
     try {
       await skipped.page.getByRole("button", { name: "Start without restoring" }).click();
       await expect(skipped.page.locator("#active-title-input")).toHaveValue("No open tab");
       await expect.poll(async () => (await readTab(first.dataDir, (await readIndex(first.dataDir)).tabs[0].id)).content).toBe("draft before crash");
     } finally {
       await closeApp(skipped.app);
+    }
+
+    await writeFile(
+      path.join(first.dataDir, "session.json"),
+      `${JSON.stringify({ abnormalShutdown: true, startedAt: new Date().toISOString() }, null, 2)}\n`,
+      "utf8"
+    );
+
+    const canceled = await launchTextEditor(testInfo, { clean: false, userDataDir: first.userDataDir, allowRecoveryPrompt: true });
+    const workspaceBeforeCancel = await readFile(path.join(first.dataDir, "workspace.json"), "utf8");
+    let canceledAppClosed = false;
+    canceled.app.once("close", () => {
+      canceledAppClosed = true;
+    });
+    try {
+      await expect(canceled.page.getByText("The app did not shut down normally last time.")).toBeVisible();
+      await canceled.page.keyboard.press("Escape");
+      await expect.poll(() => canceledAppClosed).toBe(true);
+      await expect.poll(async () => readFile(path.join(first.dataDir, "workspace.json"), "utf8")).toBe(workspaceBeforeCancel);
+    } finally {
+      await closeApp(canceled.app);
     }
   });
 
@@ -701,36 +926,36 @@ test.describe("Text Editor Electron MVP", () => {
     const { app, page, dataDir } = await launchTextEditor(testInfo);
     try {
       const id = await activeTabId(page);
-      await expect(page.locator("#left-child-tab-bar .child-tab-button")).toContainText(["Text"]);
+      await expect(visibleChildTabBar(page).locator(".child-tab-button")).toContainText(["Text"]);
 
-      await page.locator("#left-child-tab-bar .child-tab-add").click();
+      await visibleChildTabBar(page).locator(".child-tab-add").click();
       await page.locator(".dialog-input").fill("Memo");
       await page.getByRole("button", { name: "OK" }).click();
-      await page.locator("#left-child-tab-bar .child-tab-add").click();
+      await visibleChildTabBar(page).locator(".child-tab-add").click();
       await page.locator(".dialog-input").fill("Plot");
       await page.getByRole("button", { name: "OK" }).click();
-      await expect(page.locator("#left-child-tab-bar .child-tab-button")).toContainText(["Text", "Memo", "Plot"]);
+      await expect(visibleChildTabBar(page).locator(".child-tab-button")).toContainText(["Text", "Memo", "Plot"]);
 
-      await page.locator('#left-child-tab-bar [data-child-id="main"]').click();
+      await visibleChildTabBar(page).locator('[data-child-id="main"]').click();
       await replaceEditorText(page, "main body");
       await waitForSavedTab(dataDir, id, "main body");
 
-      await page.locator('#left-child-tab-bar [data-child-id="memo"]').click();
+      await visibleChildTabBar(page).locator('[data-child-id="memo"]').click();
       await replaceEditorText(page, "memo body");
       await expect.poll(async () => (await readTab(dataDir, id)).childTabs?.find((child) => child.id === "memo")?.content).toBe("memo body");
       await expect.poll(async () => (await readTab(dataDir, id)).content).toBe("main body");
 
-      await page.locator('#left-child-tab-bar [data-child-id="memo"]').click({ button: "right" });
+      await visibleChildTabBar(page).locator('[data-child-id="memo"]').click({ button: "right" });
       await page.getByRole("button", { name: "Rename" }).click();
       await page.locator(".dialog-input").fill("Notes");
       await page.getByRole("button", { name: "OK" }).click();
       await expect(page.getByRole("button", { name: "Notes" })).toBeVisible();
       await expect.poll(async () => (await readTab(dataDir, id)).childTabs?.some((child) => child.title === "Notes")).toBe(true);
 
-      await page.locator('#left-child-tab-bar [data-child-id="main"]').click();
+      await visibleChildTabBar(page).locator('[data-child-id="main"]').click();
       await expect(page.locator("#left-editor-host .cm-content")).toContainText("main body");
 
-      await page.locator('#left-child-tab-bar [data-child-id="plot"]').click({ button: "right" });
+      await visibleChildTabBar(page).locator('[data-child-id="plot"]').click({ button: "right" });
       await page.getByRole("button", { name: "Delete" }).click();
       await page.getByRole("button", { name: "Delete" }).click();
       await expect(page.getByRole("button", { name: "Plot" })).toHaveCount(0);
@@ -771,32 +996,47 @@ test.describe("Text Editor Electron MVP", () => {
     try {
       await page.locator("#active-title-input").fill("Left Story");
       await page.locator("#active-title-input").press("Enter");
+      const leftId = await activeTabId(page);
+      await expect.poll(async () => (await readIndex(dataDir)).tabs.find((tab) => tab.id === leftId)?.title).toBe("Left Story");
       await replaceEditorText(page, "left text");
+      await expectEditorTab(page, "left", leftId, "left text");
+      await waitForSavedTab(dataDir, leftId, "left text");
 
       await pressShortcut(page, "Control+N");
       await page.locator("#active-title-input").fill("Right Notes");
       await page.locator("#active-title-input").press("Enter");
       const rightId = await activeTabId(page);
-      await replaceEditorText(page, "right text");
-      await waitForSavedTab(dataDir, rightId, "right text");
+      await expect.poll(async () => (await readIndex(dataDir)).tabs.find((tab) => tab.id === rightId)?.title).toBe("Right Notes");
 
       await pressShortcut(page, "Control+\\");
       await expect(page.locator('section[data-pane-id="right"]')).toBeVisible();
-      await expect(page.locator("#right-pane-title")).toHaveText("Right Notes > Text");
+      await expect(page.locator("#right-pane-title")).toHaveValue("Right Notes");
+      await replacePaneEditorText(page, "right", "right text");
+      await expectEditorTab(page, "right", rightId, "right text");
+      await waitForSavedTab(dataDir, rightId, "right text");
+      await expect(page.locator(".minimap-panel")).toBeHidden();
+      await expect.poll(() => page.evaluate(() => {
+        const left = document.querySelector<HTMLElement>('section[data-pane-id="left"]')?.getBoundingClientRect().width ?? 0;
+        const right = document.querySelector<HTMLElement>('section[data-pane-id="right"]')?.getBoundingClientRect().width ?? 0;
+        return Math.min(left, right);
+      })).toBeGreaterThanOrEqual(319);
 
       await pressShortcut(page, "Control+1");
       await page.locator(".tab-row", { hasText: "Left Story" }).click();
-      await expect(page.locator("#left-pane-title")).toHaveText("Left Story > Text");
-      await expect(page.locator("#right-pane-title")).toHaveText("Right Notes > Text");
+      await expect(page.locator("#left-pane-title")).toHaveValue("Left Story");
+      await expect(page.locator("#right-pane-title")).toHaveValue("Right Notes");
 
+      await page.setViewportSize({ width: 1600, height: 820 });
+      await expect(page.locator(".minimap-panel")).toBeVisible();
       const resizer = page.locator("#split-resizer");
       const box = await resizer.boundingBox();
-      if (!box) {
+      const splitBox = await page.locator("#editor-split").boundingBox();
+      if (!box || !splitBox) {
         throw new Error("Split resizer was not rendered");
       }
       await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
       await page.mouse.down();
-      await page.mouse.move(box.x + 90, box.y + box.height / 2);
+      await page.mouse.move(splitBox.x + (splitBox.width - 5) * 0.7, box.y + box.height / 2);
       await page.mouse.up();
 
       await expect.poll(async () => {
@@ -804,14 +1044,31 @@ test.describe("Text Editor Electron MVP", () => {
         return (workspace.layout as { splitMode?: string; splitRatio?: number }).splitMode;
       }).toBe("vertical");
       const savedRatio = Number(((await readWorkspace(dataDir)).layout as { splitRatio?: number }).splitRatio);
-      expect(savedRatio).toBeGreaterThan(0.5);
+      expect(savedRatio).toBeGreaterThan(0.65);
+
+      await page.setViewportSize({ width: 1000, height: 700 });
+      await expect(page.locator(".minimap-panel")).toBeHidden();
+      await expect.poll(() => page.evaluate(() => {
+        const left = document.querySelector<HTMLElement>('section[data-pane-id="left"]')?.getBoundingClientRect().width ?? 0;
+        const right = document.querySelector<HTMLElement>('section[data-pane-id="right"]')?.getBoundingClientRect().width ?? 0;
+        return Math.min(left, right);
+      })).toBeGreaterThanOrEqual(319);
+      await expect.poll(async () => Number(((await readWorkspace(dataDir)).layout as { splitRatio?: number }).splitRatio)).toBeCloseTo(savedRatio, 5);
+
+      await page.setViewportSize({ width: 1600, height: 820 });
+      await expect(page.locator(".minimap-panel")).toBeVisible();
+      await expect.poll(() => page.evaluate(() => {
+        const left = document.querySelector<HTMLElement>('section[data-pane-id="left"]')?.getBoundingClientRect().width ?? 0;
+        const right = document.querySelector<HTMLElement>('section[data-pane-id="right"]')?.getBoundingClientRect().width ?? 0;
+        return left / Math.max(1, left + right);
+      })).toBeCloseTo(savedRatio, 2);
 
       await closeApp(app);
       const relaunched = await launchTextEditor(testInfo, { clean: false, userDataDir });
       try {
         await expect(relaunched.page.locator('section[data-pane-id="right"]')).toBeVisible();
-        await expect(relaunched.page.locator("#left-pane-title")).toHaveText("Left Story > Text");
-        await expect(relaunched.page.locator("#right-pane-title")).toHaveText("Right Notes > Text");
+        await expect(relaunched.page.locator("#left-pane-title")).toHaveValue("Left Story");
+        await expect(relaunched.page.locator("#right-pane-title")).toHaveValue("Right Notes");
       } finally {
         await closeApp(relaunched.app);
       }
@@ -841,9 +1098,14 @@ test.describe("Text Editor Electron MVP", () => {
     const importedUserData = path.join(testInfo.outputDir, "imported-user-data");
     const imported = await launchTextEditor(testInfo, { userDataDir: importedUserData, workspaceImportPath: zipPath });
     try {
-      await imported.page.evaluate(async () => {
-        await window.textEditor.importWorkspace();
+      await imported.app.evaluate(({ BrowserWindow }) => {
+        BrowserWindow.getAllWindows()[0]?.webContents.send("menu:action", "import-workspace");
       });
+      const restartDialog = imported.page.locator(".import-restart-dialog");
+      await expect(restartDialog).toBeVisible();
+      await expect(restartDialog.locator('[data-import-action="restart"]')).toBeVisible();
+      await expect(imported.page.locator("#active-title-input")).toBeDisabled();
+      await expect(imported.page.locator("#left-editor-host .cm-content")).toHaveAttribute("contenteditable", "false");
     } finally {
       await closeApp(imported.app);
     }
@@ -866,8 +1128,9 @@ test.describe("Text Editor Electron MVP", () => {
       await expect(page.locator('input[name="remote-enabled"]')).not.toBeChecked();
       await expect(page.locator('input[name="remote-port"]')).toHaveValue("48731");
       await expect(page.locator('input[name="remote-tab"]')).toHaveValue("Remote Inbox");
+      await expect(page.locator('textarea[name="remote-targets"]')).toHaveValue(/Remote Inbox/);
       await page.locator('input[name="remote-tab"]').fill("Phone Inbox");
-      await page.locator('textarea[name="remote-targets"]').fill("Phone Inbox\n買い物メモ\n仕事メモ");
+      await page.locator('textarea[name="remote-targets"]').fill("買い物メモ\n仕事メモ");
       await page.locator('input[name="remote-domain"]').fill("https://team.cloudflareaccess.com");
       await page.locator('input[name="remote-audience"]').fill("audience-tag");
       await page.locator('input[name="remote-email"]').fill("me@example.com");
@@ -886,7 +1149,7 @@ test.describe("Text Editor Electron MVP", () => {
     }
   });
 
-  test("Remote Inbox supports configured-target writing and read-only viewing", async ({}, testInfo) => {
+  test("Remote Inbox supports configured-target writing, dirty protection, and read-only viewing", async ({ page: remotePage }, testInfo) => {
     const { RemoteInboxServer } = await import("../dist/main/remoteInbox.js");
     const port = 49000 + (process.pid % 1000);
     const appends: Array<{ text: string; target: string }> = [];
@@ -908,6 +1171,7 @@ test.describe("Text Editor Electron MVP", () => {
     });
     (server as unknown as { verify: () => Promise<string> }).verify = async () => "me@example.com";
     await server.configure();
+    let releaseSave: (() => void) | undefined;
     try {
       const form = await fetch(`http://127.0.0.1:${port}/`);
       const html = await form.text();
@@ -957,9 +1221,43 @@ test.describe("Text Editor Electron MVP", () => {
       await expect(fetch(`http://127.0.0.1:${port}/api/tabs/tab-missing`, { headers: { "Cf-Access-Jwt-Assertion": "test" } })).resolves.toMatchObject({ status: 404 });
       await expect(fetch(`http://127.0.0.1:${port}/api/tabs/..%2Fsecret`, { headers: { "Cf-Access-Jwt-Assertion": "test" } })).resolves.toMatchObject({ status: 400 });
       await expect(fetch(`http://127.0.0.1:${port}/api/tabs`)).resolves.toMatchObject({ status: 401 });
+
+      (server as unknown as { rateLimits: Map<string, number[]> }).rateLimits.clear();
+      await remotePage.setExtraHTTPHeaders({ "Cf-Access-Jwt-Assertion": "test" });
+      const saveCanContinue = new Promise<void>((resolve) => {
+        releaseSave = resolve;
+      });
+      await remotePage.route(/\/api\/remote-inbox\?/, async (route) => {
+        if (route.request().method() === "PUT") await saveCanContinue;
+        await route.continue();
+      });
+      await remotePage.goto(`http://127.0.0.1:${port}/`);
+      const remoteEditor = remotePage.locator("#editor");
+      await expect(remoteEditor).toHaveValue("");
+      await remoteEditor.fill("未保存の下書き");
+      await expect(remotePage.locator("body")).toHaveAttribute("data-dirty", "true");
+
+      remotePage.once("dialog", async (dialog) => {
+        expect(dialog.message()).toContain("未保存");
+        await dialog.dismiss();
+      });
+      await remotePage.locator("#reload").click();
+      await expect(remoteEditor).toHaveValue("未保存の下書き");
+      await expect(remotePage.locator("body")).toHaveAttribute("data-dirty", "true");
+
+      await remotePage.locator("#save").click();
+      await expect(remotePage.locator("#save")).toBeDisabled();
+      await expect(remotePage.locator("#reload")).toBeDisabled();
+      await expect(remotePage.locator("#clear")).toBeDisabled();
+      await expect(remotePage.locator("#append")).toBeDisabled();
+      releaseSave?.();
+      await expect(remotePage.locator("#status")).toContainText("保存済み");
+      await expect(remotePage.locator("body")).toHaveAttribute("data-dirty", "false");
+
       (server as unknown as { verify: () => Promise<string> }).verify = async () => { throw new Error("email"); };
       await expect(fetch(`http://127.0.0.1:${port}/api/tabs`, { headers: { "Cf-Access-Jwt-Assertion": "test" } })).resolves.toMatchObject({ status: 403 });
     } finally {
+      releaseSave?.();
       await server.stop();
     }
   });
@@ -985,18 +1283,93 @@ test.describe("Text Editor Electron MVP", () => {
       await expect(page.locator(".search-result-row")).toHaveCount(1);
       await page.locator(".search-result-row").click();
       await expect(page.locator("#left-editor-host .cm-content")).toHaveAttribute("contenteditable", "false");
-      await page.locator("#left-editor-host .cm-content").click();
+      await focusEditor(page);
       await page.keyboard.insertText("PCからの変更");
       await expect.poll(async () => (await readTab(dataDir, target!.id)).content).toBe(tab.content);
       await pressShortcut(page, "Control+Shift+C");
-      await expect(page.locator("#save-state")).toContainText("Copied");
+      await expect(page.locator("#status-left")).toContainText("Copied");
       page.once("dialog", (dialog) => void dialog.accept());
       await page.locator(`.tab-row[data-id="${target!.id}"]`).click({ button: "right" });
       await page.getByRole("button", { name: "Clear Remote Inbox" }).click();
       await expect.poll(async () => (await readTab(dataDir, target!.id)).content).toBe("");
       await expect.poll(async () => (await readTab(dataDir, target!.id)).revision).toBe(2);
+
+      await page.locator(`.tab-row[data-id="${target!.id}"]`).click({ button: "right" });
+      await page.getByRole("button", { name: "Close" }).click();
+      await expect(page.locator(`.tab-row[data-id="${target!.id}"]`)).toHaveCount(0);
+      await expect.poll(async () => (await readTab(dataDir, target!.id)).revision).toBe(2);
     } finally {
       await closeApp(app);
+    }
+  });
+
+  test("serializes simultaneous Remote Inbox mutations for the same target", async ({}, testInfo) => {
+    const { app, page, dataDir } = await launchTextEditor(testInfo);
+    try {
+      const results = await app.evaluate(async ({ BrowserWindow, ipcMain }) => new Promise<Array<Record<string, unknown>>>((resolve) => {
+        const ids = new Set(["remote-race-a", "remote-race-b"]);
+        const received: Array<Record<string, unknown>> = [];
+        const listener = (_event: unknown, payload: Record<string, unknown>) => {
+          if (typeof payload.id !== "string" || !ids.has(payload.id)) return;
+          received.push(payload);
+          if (received.length === ids.size) {
+            ipcMain.removeListener("remote-inbox:mutate-result", listener);
+            resolve(received);
+          }
+        };
+        ipcMain.on("remote-inbox:mutate-result", listener);
+        const window = BrowserWindow.getAllWindows()[0];
+        window?.webContents.send("remote-inbox:mutate-request", { id: "remote-race-a", operation: "replace", targetTabName: "Remote Inbox", content: "first request", revision: 0 });
+        window?.webContents.send("remote-inbox:mutate-request", { id: "remote-race-b", operation: "replace", targetTabName: "Remote Inbox", content: "second request", revision: 0 });
+      }));
+
+      expect(results.filter((result) => result.ok === true)).toHaveLength(1);
+      expect(results.filter((result) => result.conflict === true)).toHaveLength(1);
+      const target = (await readIndex(dataDir)).tabs.find((tab) => tab.title === "Remote Inbox");
+      expect(target).toBeTruthy();
+      const saved = await readTab(dataDir, target!.id);
+      expect(saved.revision).toBe(1);
+      expect(["first request", "second request"]).toContain(saved.content);
+      await expect(page.locator(`.tab-row[data-id="${target!.id}"]`)).toBeVisible();
+    } finally {
+      await closeApp(app);
+    }
+  });
+
+  test("refuses Remote Inbox writes when legacy data contains duplicate target titles", async ({}, testInfo) => {
+    const userDataDir = path.join(testInfo.outputDir, "duplicate-target-user-data");
+    const dataDir = path.join(userDataDir, "data");
+    const tabsDir = path.join(dataDir, "tabs");
+    await mkdir(tabsDir, { recursive: true });
+    const updatedAt = "2026-07-13T00:00:00.000Z";
+    const documentFor = (id: string, content: string): TabDocument => ({
+      id,
+      title: "Remote Inbox",
+      content,
+      activeChildTabId: "main",
+      childTabs: [{ id: "main", title: "本文", content, updatedAt }],
+      updatedAt,
+      revision: 0
+    });
+    const firstDocument = documentFor("tab-duplicate-a", "first original");
+    const secondDocument = documentFor("tab-duplicate-b", "second original");
+    await writeFile(path.join(dataDir, "workspace.json"), `${JSON.stringify({ activeTabId: firstDocument.id, openedTabIds: [firstDocument.id, secondDocument.id], recentTabIds: [firstDocument.id, secondDocument.id], remoteInbox: { targetTabName: "Remote Inbox", targetTabNames: ["Remote Inbox"] } }, null, 2)}\n`, "utf8");
+    await writeFile(path.join(tabsDir, "index.json"), `${JSON.stringify({ groups: [], ungroupedTabIds: [firstDocument.id, secondDocument.id], tabs: [firstDocument, secondDocument].map((tab) => ({ id: tab.id, title: tab.title, updatedAt, wordCount: 2, pinned: true })) }, null, 2)}\n`, "utf8");
+    await writeFile(path.join(tabsDir, `${firstDocument.id}.json`), `${JSON.stringify(firstDocument, null, 2)}\n`, "utf8");
+    await writeFile(path.join(tabsDir, `${secondDocument.id}.json`), `${JSON.stringify(secondDocument, null, 2)}\n`, "utf8");
+
+    const launched = await launchTextEditor(testInfo, { clean: false, userDataDir });
+    try {
+      const result = await launched.app.evaluate(async ({ BrowserWindow, ipcMain }) => new Promise<Record<string, unknown>>((resolve) => {
+        ipcMain.once("remote-inbox:mutate-result", (_event, payload) => resolve(payload as Record<string, unknown>));
+        BrowserWindow.getAllWindows()[0]?.webContents.send("remote-inbox:mutate-request", { id: "duplicate-target", operation: "replace", targetTabName: "Remote Inbox", content: "must not be written", revision: 0 });
+      }));
+      expect(result.ok).toBe(false);
+      expect(String(result.error)).toContain("multiple tabs");
+      await expect.poll(async () => (await readTab(dataDir, firstDocument.id)).content).toBe("first original");
+      await expect.poll(async () => (await readTab(dataDir, secondDocument.id)).content).toBe("second original");
+    } finally {
+      await closeApp(launched.app);
     }
   });
 });

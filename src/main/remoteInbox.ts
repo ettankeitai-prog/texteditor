@@ -40,6 +40,7 @@ export class RemoteInboxServer {
   private readonly csrfTokens = new Map<string, number>();
   private readonly rateLimits = new Map<string, number[]>();
   private readonly jwks = new Map<string, ReturnType<Jose["createRemoteJWKSet"]>>();
+  private auditTail: Promise<void> = Promise.resolve();
 
   constructor(private readonly options: RemoteInboxServerOptions) {}
 
@@ -50,6 +51,7 @@ export class RemoteInboxServer {
       return { state: "stopped" };
     }
     if (!validSettings(settings)) {
+      await this.stop();
       const status = { state: "error" as const, message: "Remote Inbox settings are incomplete or invalid." };
       this.options.onStatus(status);
       return status;
@@ -87,6 +89,7 @@ export class RemoteInboxServer {
     this.server = null;
     this.currentPort = null;
     if (server?.listening) await new Promise<void>((resolve) => server.close(() => resolve()));
+    await this.auditTail;
     this.options.onStatus({ state: "stopped" });
   }
 
@@ -97,7 +100,7 @@ export class RemoteInboxServer {
   private async handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
     securityHeaders(response);
     const url = new URL(request.url ?? "/", "http://127.0.0.1");
-    if (request.method === "GET" && url.pathname === "/api/health") return json(response, 200, { ok: true, version: "1.8.0" });
+    if (request.method === "GET" && url.pathname === "/api/health") return json(response, 200, { ok: true, version: "1.9.0" });
     if (request.method === "GET" && url.pathname === "/") return this.form(request, response);
     if (request.method === "GET" && url.pathname === "/api/read") return this.read(url, request, response);
     if (request.method === "GET" && url.pathname === "/api/remote-inbox") return this.getRemoteInbox(url, request, response);
@@ -114,13 +117,12 @@ export class RemoteInboxServer {
     this.csrfTokens.set(token, Date.now() + 30 * 60_000);
     response.setHeader("Set-Cookie", `remoteInboxCsrf=${token}; Path=/; HttpOnly; SameSite=Strict; Secure; Max-Age=1800`);
     response.setHeader("Content-Type", "text/html; charset=utf-8");
-    response.end(withTabViewingLinks(formHtmlV18(token, targetNames(this.options.getSettings()))));
+    response.end(withTabViewingLinks(formHtmlV19(token, targetNames(this.options.getSettings()))));
   }
 
   private async append(request: IncomingMessage, response: ServerResponse): Promise<void> {
     const settings = this.options.getSettings();
-    const origin = request.headers.origin;
-    if (origin && origin !== `https://${request.headers.host}`) return json(response, 403, { ok: false, error: "Invalid origin" });
+    if (!validRequestOrigin(request)) return json(response, 403, { ok: false, error: "Invalid origin" });
     const csrf = request.headers["x-csrf-token"];
     const cookie = request.headers.cookie?.match(/(?:^|;\s*)remoteInboxCsrf=([^;]+)/)?.[1];
     if (typeof csrf !== "string" || !cookie || csrf !== cookie || this.csrfTokens.get(csrf)! < Date.now()) {
@@ -176,7 +178,17 @@ export class RemoteInboxServer {
     if (!email) return;
     if (!isValidTargetName(target) || !targetNames(settings).includes(target)) { await this.audit("failure", email, 0, "invalid-target", auditMeta(request, "REMOTE_INBOX_READ", undefined, target)); return json(response, 400, { ok: false, error: "Invalid target" }); }
     if (!this.allow(email)) return json(response, 429, { ok: false, error: "Too many requests" });
-    const document = await this.options.getRemoteInbox(target);
+    let document: RemoteInboxDocument;
+    try {
+      document = await this.options.getRemoteInbox(target);
+    } catch (error) {
+      const ambiguous = error instanceof Error && error.message === "Remote Inbox target is ambiguous";
+      await this.audit("failure", email, 0, ambiguous ? "ambiguous-target" : "load", auditMeta(request, "REMOTE_INBOX_READ", undefined, target));
+      return json(response, ambiguous ? 409 : 500, {
+        ok: false,
+        error: ambiguous ? "Remote Inbox target is ambiguous" : "Could not load Remote Inbox"
+      });
+    }
     await this.audit("success", email, 0, undefined, auditMeta(request, "REMOTE_INBOX_READ", document.id, target, document.revision, document.content.length, document.content.length));
     json(response, 200, { ok: true, ...document });
   }
@@ -185,8 +197,7 @@ export class RemoteInboxServer {
     const settings = this.options.getSettings();
     const target = url.searchParams.get("target") ?? settings.targetTabName;
     const operationName = operation === "replace" ? "REMOTE_INBOX_REPLACE" : "REMOTE_INBOX_CLEAR";
-    const origin = request.headers.origin;
-    if (origin && origin !== `https://${request.headers.host}`) return json(response, 403, { ok: false, error: "Invalid origin" });
+    if (!validRequestOrigin(request)) return json(response, 403, { ok: false, error: "Invalid origin" });
     if (!this.validCsrf(request)) { await this.audit("failure", undefined, 0, "csrf", auditMeta(request, operationName, undefined, target)); return json(response, 403, { ok: false, error: "Invalid request token" }); }
     const email = await this.authenticate(request, response, settings, operationName, target);
     if (!email) return;
@@ -259,22 +270,37 @@ export class RemoteInboxServer {
   }
 
   private async audit(result: "success" | "failure", email: string | undefined, size: number, error?: string, metadata: Record<string, unknown> = {}): Promise<void> {
-    const file = path.join(this.options.dataRoot(), "remote-inbox.log");
-    await mkdir(path.dirname(file), { recursive: true });
-    let entries: string[] = [];
-    try { entries = (await readFile(file, "utf8")).split("\n").filter(Boolean).slice(-499); } catch { /* first audit entry */ }
-    entries.push(JSON.stringify({ receivedAt: new Date().toISOString(), result, email, size, error, ...metadata }));
-    await writeFile(file, `${entries.join("\n")}\n`, "utf8");
+    const operation = this.auditTail.then(async () => {
+      const file = path.join(this.options.dataRoot(), "remote-inbox.log");
+      await mkdir(path.dirname(file), { recursive: true });
+      let entries: string[] = [];
+      try { entries = (await readFile(file, "utf8")).split("\n").filter(Boolean).slice(-499); } catch { /* first audit entry */ }
+      entries.push(JSON.stringify({ receivedAt: new Date().toISOString(), result, email, size, error, ...metadata }));
+      await writeFile(file, `${entries.join("\n")}\n`, "utf8");
+    });
+    this.auditTail = operation.catch((auditError) => {
+      console.error("Remote Inbox audit write failed:", auditError);
+    });
+    await this.auditTail;
   }
 }
 
 function validSettings(value: RemoteInboxSettings): boolean {
   try { const url = new URL(value.accessTeamDomain); return url.protocol === "https:" && Boolean(url.hostname) && Number.isInteger(value.port) && value.port >= 1024 && value.port <= 65535 && isValidTargetName(value.targetTabName) && Boolean(value.accessAudience.trim()) && /^\S+@\S+\.\S+$/.test(value.allowedEmail.trim()); } catch { return false; }
 }
+function validRequestOrigin(request: IncomingMessage): boolean {
+  const origin = request.headers.origin;
+  if (!origin) return true;
+  const host = request.headers.host ?? "";
+  if (origin === `https://${host}`) return true;
+  const bracketedHost = /^\[([^\]]+)](?::\d+)?$/.exec(host);
+  const hostname = (bracketedHost?.[1] ?? host.replace(/:\d+$/, "")).toLowerCase();
+  return (hostname === "127.0.0.1" || hostname === "localhost" || hostname === "::1") && origin === `http://${host}`;
+}
 function isValidTargetName(value: string): boolean { return value === value.trim() && value.length > 0 && value.length <= 120 && !/[\u0000-\u001F\u007F]/.test(value); }
 function targetNames(settings: RemoteInboxSettings): string[] {
   const names = Array.isArray(settings.targetTabNames) ? settings.targetTabNames.filter(isValidTargetName) : [];
-  return [...new Set(names)].length ? [...new Set(names)] : [settings.targetTabName];
+  return [...new Set([settings.targetTabName, ...names].filter(isValidTargetName))];
 }
 function clientIp(request: IncomingMessage): string { const forwarded = request.headers["cf-connecting-ip"]; return typeof forwarded === "string" && forwarded ? forwarded : request.socket.remoteAddress ?? "unknown"; }
 function auditMeta(request: IncomingMessage, operation: string, tabId?: string, targetTabName?: string, revision?: number, beforeCharacters?: number, afterCharacters?: number): Record<string, unknown> { return { operation, tabId, targetTabName, clientIp: clientIp(request), revision, beforeCharacters, afterCharacters }; }
@@ -316,6 +342,283 @@ function formHtmlV18(token: string, targets: string[]): string {
 <section id="inbox"><select id="target" class="target-select" aria-label="Remote Inbox">${options}</select><div id="status-row" class="status-row"><span id="status"></span><button id="recover" class="recovery" type="button">セッション回復</button></div><div class="note-section"><h2 class="section-title">本文</h2><textarea id="editor" class="editor" aria-label="Remote Inbox本文"></textarea><div class="actions save-row"><button id="save" class="primary" type="button">保存</button><button id="reload" class="secondary" type="button">再読み込み</button><button id="copy" class="secondary" type="button">全文コピー</button><button id="clear" class="quiet" type="button">クリア</button></div></div><div class="note-section"><h2 class="section-title">追記</h2><textarea id="append-text" class="append-editor" aria-label="追記メモ" placeholder="追記するメモ"></textarea><div class="actions"><button id="append" class="secondary" type="button">追記</button></div></div></section>
 <section id="tabs" hidden><select id="tab-select" class="target-select" aria-label="タブ選択"></select><div id="tab-meta" class="tab-meta"></div><input id="tab-search" type="search" aria-label="本文内検索" placeholder="本文内検索"><div class="actions"><button id="tab-reload" class="secondary" type="button">再読み込み</button><button id="tab-copy" class="secondary" type="button">全文コピー</button></div><pre id="tab-content" class="readonly"></pre></section></main>
 <script>const $=s=>document.querySelector(s),inbox=$('#inbox'),tabs=$('#tabs'),target=$('#target'),editor=$('#editor'),statusRow=$('#status-row'),status=$('#status'),recover=$('#recover'),appendText=$('#append-text'),tabSelect=$('#tab-select'),tabContent=$('#tab-content'),tabMeta=$('#tab-meta'),tabSearch=$('#tab-search'),csrf='${token}',NL=String.fromCharCode(10);let revision=0,updatedAt='',tabRaw='';function mode(v){inbox.hidden=v!=='inbox';tabs.hidden=v!=='tabs';$('#inbox-mode').classList.toggle('active',v==='inbox');$('#tabs-mode').classList.toggle('active',v==='tabs')}function timeLabel(value){if(!value)return'';let d=new Date(value);return String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0')+' 更新'}function setStatus(message,error=false,recoverable=false){status.textContent=message;statusRow.classList.toggle('error',error);recover.style.display=recoverable?'inline-block':'none'}function savedStatus(saved){let time=timeLabel(updatedAt);setStatus((saved?'保存済み　':'')+time)}$('#inbox-mode').onclick=()=>mode('inbox');$('#tabs-mode').onclick=()=>{mode('tabs');loadTabs()};async function loadInbox(){let r=await fetch('/api/remote-inbox?target='+encodeURIComponent(target.value));if(!r.ok){setStatus('読み込みに失敗しました',true,true);return}let d=await r.json();editor.value=d.content;revision=d.revision;updatedAt=d.updatedAt;savedStatus(false)}async function mutate(method){setStatus('保存中');let body={revision};if(method==='PUT')body.content=editor.value;let r=await fetch('/api/remote-inbox?target='+encodeURIComponent(target.value),{method,headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},body:JSON.stringify(body)});let d=await r.json();if(r.status===409){setStatus('別の画面または操作によって内容が更新されています。再読み込みしてから編集内容を確認してください。',true,true);return}if(!r.ok){setStatus('保存に失敗しました',true,true);return}editor.value=d.content;revision=d.revision;updatedAt=d.updatedAt;savedStatus(true)}async function append(){if(!appendText.value.trim())return;let r=await fetch('/api/append',{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},body:JSON.stringify({target:target.value,text:appendText.value})});if(!r.ok){setStatus('追記に失敗しました',true,true);return}appendText.value='';await loadInbox()}async function copy(value){await navigator.clipboard.writeText(value)}$('#save').onclick=()=>mutate('PUT');$('#reload').onclick=loadInbox;recover.onclick=loadInbox;$('#copy').onclick=()=>copy(editor.value);$('#clear').onclick=()=>{if(confirm('Remote Inboxの内容をすべて削除します。'+NL+'この操作は元に戻せません。'))mutate('DELETE')};$('#append').onclick=append;appendText.onkeydown=event=>{if((event.ctrlKey||event.metaKey)&&event.key==='Enter'){event.preventDefault();append()}};target.onchange=loadInbox;async function loadTabs(){let r=await fetch('/api/tabs');if(!r.ok){tabMeta.textContent='一覧を取得できませんでした。';return}let d=await r.json();tabSelect.replaceChildren(...d.tabs.map(tab=>{let option=document.createElement('option');option.value=tab.id;option.textContent=tab.title;return option}));if(d.tabs.length)loadTab();else{tabRaw='';tabContent.textContent='';tabMeta.textContent='閲覧を許可されたタブがありません。'}}async function loadTab(){if(!tabSelect.value)return;let r=await fetch('/api/tabs/'+encodeURIComponent(tabSelect.value));if(!r.ok){tabMeta.textContent='タブを取得できませんでした。';return}let d=await r.json();tabRaw=d.content;tabContent.textContent=filterTab();tabMeta.textContent=d.title+'　'+timeLabel(d.updatedAt)}function filterTab(){let query=tabSearch.value.trim();return query?tabRaw.split(NL).filter(line=>line.includes(query)).join(NL):tabRaw}tabSelect.onchange=loadTab;tabSearch.oninput=()=>tabContent.textContent=filterTab();$('#tab-reload').onclick=loadTab;$('#tab-copy').onclick=()=>copy(tabRaw);loadInbox()</script></html>`;
+}
+
+function formHtmlV19(token: string, targets: string[]): string {
+  const replacement = `<script>
+const $=selector=>document.querySelector(selector),
+  main=$('main'),
+  inbox=$('#inbox'),
+  tabs=$('#tabs'),
+  target=$('#target'),
+  editor=$('#editor'),
+  statusRow=$('#status-row'),
+  status=$('#status'),
+  recover=$('#recover'),
+  appendText=$('#append-text'),
+  tabSelect=$('#tab-select'),
+  tabContent=$('#tab-content'),
+  tabMeta=$('#tab-meta'),
+  tabSearch=$('#tab-search'),
+  csrf='${token}',
+  NL=String.fromCharCode(10),
+  lockedControls=[
+    target,
+    editor,
+    appendText,
+    tabSelect,
+    $('#inbox-mode'),
+    $('#tabs-mode'),
+    $('#save'),
+    $('#reload'),
+    recover,
+    $('#clear'),
+    $('#append'),
+    $('#tab-reload')
+  ];
+let revision=0,
+  updatedAt='',
+  tabRaw='',
+  baselineContent='',
+  loadedTarget=target.value,
+  dirty=false,
+  busy=false;
+
+function mode(value){
+  inbox.hidden=value!=='inbox';
+  tabs.hidden=value!=='tabs';
+  $('#inbox-mode').classList.toggle('active',value==='inbox');
+  $('#tabs-mode').classList.toggle('active',value==='tabs');
+}
+function timeLabel(value){
+  if(!value)return'';
+  let date=new Date(value);
+  return String(date.getHours()).padStart(2,'0')+':'+String(date.getMinutes()).padStart(2,'0')+' 更新';
+}
+function setStatus(message,error=false,recoverable=false){
+  status.textContent=message;
+  statusRow.classList.toggle('error',error);
+  recover.style.display=recoverable?'inline-block':'none';
+}
+function savedStatus(){
+  let time=timeLabel(updatedAt);
+  setStatus('保存済み'+(time?'　'+time:''));
+}
+function syncDirtyState(){
+  document.body.dataset.dirty=dirty?'true':'false';
+}
+function updateDirty(){
+  dirty=editor.value!==baselineContent;
+  syncDirtyState();
+  if(dirty)setStatus('未保存の変更');
+  else savedStatus();
+}
+function setBusy(value){
+  busy=value;
+  document.body.dataset.busy=value?'true':'false';
+  main.setAttribute('aria-busy',value?'true':'false');
+  for(let control of lockedControls)control.disabled=value;
+}
+async function runBusy(task,onError){
+  if(busy)return false;
+  setBusy(true);
+  try{return await task()}
+  catch{if(onError)onError();return false}
+  finally{setBusy(false)}
+}
+async function readJson(response){
+  try{return await response.json()}
+  catch{return null}
+}
+function isInboxDocument(value){
+  return Boolean(value)&&typeof value.content==='string'&&Number.isInteger(value.revision)&&typeof value.updatedAt==='string';
+}
+function applyInbox(value,targetName){
+  editor.value=value.content;
+  baselineContent=value.content;
+  revision=value.revision;
+  updatedAt=value.updatedAt;
+  loadedTarget=targetName;
+  target.value=targetName;
+  dirty=false;
+  syncDirtyState();
+  savedStatus();
+}
+function confirmDiscard(action){
+  if(!dirty)return true;
+  return confirm('未保存の本文があります。'+NL+action+NL+'未保存の変更を破棄して続けますか？');
+}
+async function loadInbox(targetName=target.value){
+  let previousTarget=loadedTarget;
+  let action=targetName===loadedTarget?'再読み込みすると、現在の入力内容は失われます。':'送信先を変更すると、現在の入力内容は失われます。';
+  if(!confirmDiscard(action)){
+    target.value=previousTarget;
+    return false;
+  }
+  let loaded=await runBusy(async()=>{
+    setStatus('読み込み中');
+    let response=await fetch('/api/remote-inbox?target='+encodeURIComponent(targetName));
+    let value=await readJson(response);
+    if(!response.ok||!isInboxDocument(value)){
+      setStatus('読み込みに失敗しました。入力内容は保持されています。',true,true);
+      return false;
+    }
+    applyInbox(value,targetName);
+    return true;
+  },()=>setStatus('読み込みに失敗しました。入力内容は保持されています。',true,true));
+  if(!loaded)target.value=previousTarget;
+  return loaded;
+}
+async function mutate(method){
+  let targetName=loadedTarget||target.value;
+  return runBusy(async()=>{
+    setStatus(method==='PUT'?'保存中':'クリア中');
+    let body={revision};
+    if(method==='PUT')body.content=editor.value;
+    let response=await fetch('/api/remote-inbox?target='+encodeURIComponent(targetName),{
+      method,
+      headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},
+      body:JSON.stringify(body)
+    });
+    let value=await readJson(response);
+    if(response.status===409){
+      setStatus('別の画面または操作によって内容が更新されています。再読み込みしてから編集内容を確認してください。',true,true);
+      return false;
+    }
+    if(!response.ok||!isInboxDocument(value)){
+      setStatus('保存に失敗しました。入力内容は保持されています。',true,true);
+      return false;
+    }
+    applyInbox(value,targetName);
+    return true;
+  },()=>setStatus('保存に失敗しました。入力内容は保持されています。',true,true));
+}
+async function append(){
+  if(busy||!appendText.value.trim())return false;
+  if(!confirmDiscard('追記後に最新の本文を再読み込みします。'))return false;
+  let targetName=loadedTarget||target.value,
+    pendingText=appendText.value,
+    appended=false;
+  return runBusy(async()=>{
+    setStatus('追記中');
+    let response=await fetch('/api/append',{
+      method:'POST',
+      headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},
+      body:JSON.stringify({target:targetName,text:pendingText})
+    });
+    if(!response.ok){
+      setStatus('追記に失敗しました。入力内容は保持されています。',true,true);
+      return false;
+    }
+    appended=true;
+    appendText.value='';
+    let reloadResponse=await fetch('/api/remote-inbox?target='+encodeURIComponent(targetName));
+    let value=await readJson(reloadResponse);
+    if(!reloadResponse.ok||!isInboxDocument(value)){
+      setStatus('追記しましたが本文を再読み込みできませんでした。本文の入力内容は保持されています。',true,true);
+      return false;
+    }
+    applyInbox(value,targetName);
+    return true;
+  },()=>setStatus(
+    appended?'追記しましたが本文を再読み込みできませんでした。本文の入力内容は保持されています。':'追記に失敗しました。入力内容は保持されています。',
+    true,
+    true
+  ));
+}
+async function copy(value){
+  await navigator.clipboard.writeText(value);
+}
+async function loadTabs(){
+  let hasTabs=await runBusy(async()=>{
+    tabMeta.textContent='一覧を読み込み中';
+    let response=await fetch('/api/tabs');
+    let value=await readJson(response);
+    if(!response.ok||!value||!Array.isArray(value.tabs)){
+      tabMeta.textContent='一覧を取得できませんでした。';
+      return false;
+    }
+    tabSelect.replaceChildren(...value.tabs.map(tab=>{
+      let option=document.createElement('option');
+      option.value=tab.id;
+      option.textContent=tab.title;
+      return option;
+    }));
+    if(!value.tabs.length){
+      tabRaw='';
+      tabContent.textContent='';
+      tabMeta.textContent='閲覧を許可されたタブがありません。';
+      return false;
+    }
+    return true;
+  },()=>{tabMeta.textContent='一覧を取得できませんでした。'});
+  if(hasTabs)return loadTab();
+  return false;
+}
+async function loadTab(){
+  if(!tabSelect.value||busy)return false;
+  let tabId=tabSelect.value;
+  return runBusy(async()=>{
+    tabMeta.textContent='タブを読み込み中';
+    let response=await fetch('/api/tabs/'+encodeURIComponent(tabId));
+    let value=await readJson(response);
+    if(!response.ok||!value||typeof value.content!=='string'){
+      tabMeta.textContent='タブを取得できませんでした。';
+      return false;
+    }
+    tabRaw=value.content;
+    tabContent.textContent=filterTab();
+    tabMeta.textContent=value.title+'　'+timeLabel(value.updatedAt);
+    return true;
+  },()=>{tabMeta.textContent='タブを取得できませんでした。'});
+}
+function filterTab(){
+  let query=tabSearch.value.trim();
+  return query?tabRaw.split(NL).filter(line=>line.includes(query)).join(NL):tabRaw;
+}
+
+$('#inbox-mode').onclick=()=>mode('inbox');
+$('#tabs-mode').onclick=async()=>{
+  if(busy)return;
+  if(dirty&&!confirm('未保存の本文があります。'+NL+'保存せずタブ閲覧へ移動しますか？入力内容はRemote Inbox画面に保持されます。'))return;
+  mode('tabs');
+  await loadTabs();
+};
+$('#save').onclick=()=>void mutate('PUT');
+$('#reload').onclick=()=>void loadInbox();
+recover.onclick=()=>void loadInbox();
+$('#copy').onclick=()=>void copy(editor.value);
+$('#clear').onclick=()=>{
+  let message='Remote Inboxの内容をすべて削除します。'+NL+'この操作は元に戻せません。';
+  if(dirty)message+=NL+'未保存の本文も破棄されます。';
+  if(confirm(message))void mutate('DELETE');
+};
+$('#append').onclick=()=>void append();
+appendText.onkeydown=event=>{
+  if((event.ctrlKey||event.metaKey)&&event.key==='Enter'){
+    event.preventDefault();
+    void append();
+  }
+};
+editor.oninput=updateDirty;
+target.onchange=()=>void loadInbox(target.value);
+tabSelect.onchange=()=>void loadTab();
+tabSearch.oninput=()=>{tabContent.textContent=filterTab()};
+$('#tab-reload').onclick=()=>void loadTab();
+$('#tab-copy').onclick=()=>void copy(tabRaw);
+addEventListener('beforeunload',event=>{
+  if(!dirty&&!appendText.value.length)return;
+  event.preventDefault();
+  event.returnValue='';
+});
+syncDirtyState();
+void loadInbox();
+</script></html>`;
+  const styled = formHtmlV18(token, targets).replace(
+    "</style>",
+    "button:disabled,select:disabled,textarea:disabled{opacity:.55;cursor:wait}</style>"
+  );
+  return styled.replace(/<script>[\s\S]*<\/script><\/html>$/, () => replacement);
 }
 
 function withTabViewingLinks(html: string): string {

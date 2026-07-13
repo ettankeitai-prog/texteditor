@@ -56,7 +56,8 @@ type MenuAction =
   | "focus-left"
   | "focus-right"
   | "font-up"
-  | "font-down";
+  | "font-down"
+  | "reload-app";
 
 const app = document.querySelector<HTMLDivElement>("#app");
 
@@ -78,29 +79,30 @@ app.innerHTML = `
         <div class="search-results" id="global-search-results"></div>
       </aside>
       <div class="sidebar-resizer" id="sidebar-resizer" title="Resize sidebar"></div>
-      <main class="editor-area">
+      <main class="editor-area" id="editor-area">
         <div class="editor-header">
           <div class="editor-title-block">
-            <input class="active-title-input" id="active-title-input" value="No tab" aria-label="Active tab title" />
-            <div class="active-meta" id="active-meta"></div>
+            <input class="active-title-input" id="active-title-input" value="No tab" aria-label="Active tab title" disabled />
+            <div class="active-meta" id="active-meta" hidden></div>
           </div>
-          <div class="save-state" id="save-state">Loading</div>
+          <div class="child-tab-bar single-child-tab-bar" id="single-child-tab-bar"></div>
         </div>
+        <div class="save-state" id="save-state" aria-live="polite">Loading</div>
         <div class="editor-split" id="editor-split">
           <section class="editor-pane is-active" data-pane-id="left">
             <div class="pane-editor-header">
-              <span class="pane-editor-title" id="left-pane-title">No tab</span>
+              <input class="pane-editor-title pane-title-input" id="left-pane-title" data-pane-id="left" value="No tab" aria-label="Left editor tab title" disabled />
               <div class="child-tab-bar" id="left-child-tab-bar"></div>
             </div>
-            <div class="editor-host" id="left-editor-host"></div>
+            <div class="editor-host" id="left-editor-host" data-testid="active-editor-host"></div>
           </section>
           <div class="split-resizer" id="split-resizer" hidden></div>
           <section class="editor-pane" data-pane-id="right" hidden>
             <div class="pane-editor-header">
-              <span class="pane-editor-title" id="right-pane-title">No tab</span>
+              <input class="pane-editor-title pane-title-input" id="right-pane-title" data-pane-id="right" value="No tab" aria-label="Right editor tab title" disabled />
               <div class="child-tab-bar" id="right-child-tab-bar"></div>
             </div>
-            <div class="editor-host" id="right-editor-host"></div>
+            <div class="editor-host" id="right-editor-host" data-testid="editor-host-right"></div>
           </section>
         </div>
       </main>
@@ -123,6 +125,7 @@ const globalSearchInput = document.querySelector<HTMLInputElement>("#global-sear
 const globalSearchSummary = document.querySelector<HTMLDivElement>("#global-search-summary")!;
 const globalSearchResults = document.querySelector<HTMLDivElement>("#global-search-results")!;
 const workspaceElement = document.querySelector<HTMLDivElement>(".workspace")!;
+const editorArea = document.querySelector<HTMLElement>("#editor-area")!;
 const sidebarResizer = document.querySelector<HTMLDivElement>("#sidebar-resizer")!;
 const editorSplit = document.querySelector<HTMLDivElement>("#editor-split")!;
 const splitResizer = document.querySelector<HTMLDivElement>("#split-resizer")!;
@@ -130,10 +133,11 @@ const leftPaneElement = document.querySelector<HTMLElement>('[data-pane-id="left
 const rightPaneElement = document.querySelector<HTMLElement>('[data-pane-id="right"]')!;
 const leftEditorHost = document.querySelector<HTMLDivElement>("#left-editor-host")!;
 const rightEditorHost = document.querySelector<HTMLDivElement>("#right-editor-host")!;
-const leftPaneTitle = document.querySelector<HTMLSpanElement>("#left-pane-title")!;
-const rightPaneTitle = document.querySelector<HTMLSpanElement>("#right-pane-title")!;
+const leftPaneTitle = document.querySelector<HTMLInputElement>("#left-pane-title")!;
+const rightPaneTitle = document.querySelector<HTMLInputElement>("#right-pane-title")!;
 const leftChildTabBar = document.querySelector<HTMLDivElement>("#left-child-tab-bar")!;
 const rightChildTabBar = document.querySelector<HTMLDivElement>("#right-child-tab-bar")!;
+const singleChildTabBar = document.querySelector<HTMLDivElement>("#single-child-tab-bar")!;
 const activeTitleInput = document.querySelector<HTMLInputElement>("#active-title-input")!;
 const activeMeta = document.querySelector<HTMLDivElement>("#active-meta")!;
 const saveState = document.querySelector<HTMLDivElement>("#save-state")!;
@@ -144,22 +148,29 @@ const minimap = document.querySelector<HTMLPreElement>("#minimap")!;
 
 let workspace: WorkspaceState = { ...defaultWorkspace };
 let tabIndex: TabsIndex = { tabs: [] };
-let dataRoot = "";
 let activeTabId: string | null = null;
 let saveTimer: number | null = null;
+let saveRetryTimer: number | null = null;
+let saveRetryAttempt = 0;
 let backupTimer: number | null = null;
 let creatingTab = false;
 let titleBeforeEdit = "";
 let draggedItem: { type: "tab" | "group"; id: string } | null = null;
 let selectedGroupId: string | null = null;
 let globalSearchTimer: number | null = null;
+let minimapTimer: number | null = null;
 let globalSearchSequence = 0;
 let globalSearchCache: GlobalSearchResult[] = [];
 let workspaceImportedNeedsRestart = false;
+let workspaceImportInProgress = false;
+let appStateLoaded = false;
+let bootstrapReadyForClose = false;
 let statusContentCache = "";
 let statusCharacterCountCache = 0;
 
 const UNGROUPED_COLLAPSED_ID = "ungrouped:collapsed";
+const SPLIT_PANE_MIN_WIDTH = 320;
+const SPLIT_RESIZER_WIDTH = 5;
 
 const contentCache = new Map<string, TabDocument>();
 const dirtyTabIds = new Set<string>();
@@ -168,7 +179,7 @@ type EditorPaneState = {
   id: PaneId;
   element: HTMLElement;
   host: HTMLDivElement;
-  titleElement: HTMLSpanElement;
+  titleElement: HTMLInputElement;
   childBar: HTMLDivElement;
   view: EditorView | null;
   activeTabId: string | null;
@@ -293,6 +304,8 @@ type UiText = {
   workspaceExported: string;
   workspaceImported: string;
   restartRequired: string;
+  restartNow: string;
+  restartFailed: string;
   currentWorkspaceBackup: string;
   splitRight: string;
   closeSplit: string;
@@ -329,7 +342,7 @@ type UiText = {
 
 const uiText: Record<Locale, UiText> = {
   en: {
-    tabs: "Tabs",
+    tabs: "Open Tabs",
     open: "Open",
     newTab: "New tab",
     untitled: "Untitled",
@@ -406,6 +419,8 @@ const uiText: Record<Locale, UiText> = {
     workspaceExported: "Workspace exported",
     workspaceImported: "Workspace imported",
     restartRequired: "Import completed. Please restart the app to load the imported workspace.",
+    restartNow: "Restart now",
+    restartFailed: "Restart failed",
     currentWorkspaceBackup: "Current workspace backup",
     splitRight: "Split Right",
     closeSplit: "Close Split",
@@ -440,7 +455,7 @@ const uiText: Record<Locale, UiText> = {
     languageChanged: "Language switched"
   },
   jp: {
-    tabs: "タブ",
+    tabs: "開いているタブ",
     open: "開いているタブ",
     newTab: "新規タブ",
     untitled: "無題",
@@ -517,6 +532,8 @@ const uiText: Record<Locale, UiText> = {
     workspaceExported: "Workspace をエクスポートしました",
     workspaceImported: "Workspace をインポートしました",
     restartRequired: "インポートが完了しました。反映するにはアプリを再起動してください。",
+    restartNow: "今すぐ再起動",
+    restartFailed: "再起動に失敗しました",
     currentWorkspaceBackup: "現在のWorkspaceバックアップ",
     splitRight: "右に分割",
     closeSplit: "分割を閉じる",
@@ -897,7 +914,7 @@ function isRemoteInboxTabId(id: string | null | undefined): boolean {
 }
 
 function editorReadOnlyExtensions(pane: EditorPaneState) {
-  const readOnly = isRemoteInboxTabId(pane.activeTabId);
+  const readOnly = !bootstrapReadyForClose || workspaceImportedNeedsRestart || workspaceImportInProgress || isRemoteInboxTabId(pane.activeTabId);
   return [EditorState.readOnly.of(readOnly), EditorView.editable.of(!readOnly)];
 }
 
@@ -919,13 +936,39 @@ function updateMetaFromDocument(tab: TabDocument): void {
 }
 
 async function saveWorkspace(): Promise<void> {
-  workspace = await window.textEditor.saveWorkspace(workspace);
+  const serializedSnapshot = JSON.stringify(workspace);
+  const snapshot = JSON.parse(serializedSnapshot) as WorkspaceState;
+  const normalized = await window.textEditor.saveWorkspace(snapshot);
+  if (JSON.stringify(workspace) === serializedSnapshot) {
+    workspace = normalized;
+  }
 }
 
-async function saveCurrentTabNow(): Promise<void> {
-  const targetIds = dirtyTabIds.size > 0 ? [...dirtyTabIds] : [activePane().activeTabId].filter((id): id is string => Boolean(id));
-  if (targetIds.length === 0) {
+function clearSaveRetry(): void {
+  if (saveRetryTimer !== null) {
+    window.clearTimeout(saveRetryTimer);
+    saveRetryTimer = null;
+  }
+}
+
+function scheduleSaveRetry(): void {
+  if (saveRetryTimer !== null || dirtyTabIds.size === 0 || saveRetryAttempt >= 3) {
     return;
+  }
+  const delay = 750 * 2 ** saveRetryAttempt;
+  saveRetryAttempt += 1;
+  saveRetryTimer = window.setTimeout(() => {
+    saveRetryTimer = null;
+    void saveCurrentTabNow();
+  }, delay);
+}
+
+async function saveCurrentTabNow(options: { retry?: boolean } = {}): Promise<boolean> {
+  const targetIds = [...dirtyTabIds];
+  if (targetIds.length === 0) {
+    clearSaveRetry();
+    saveRetryAttempt = 0;
+    return true;
   }
 
   try {
@@ -946,12 +989,29 @@ async function saveCurrentTabNow(): Promise<void> {
       updateMetaFromDocument(saved);
       dirtyTabIds.delete(saved.id);
     }
-    setSaveState(text().saved);
+    if (dirtyTabIds.size > 0) {
+      setSaveState(text().unsaved, "dirty");
+      if (saveTimer === null) {
+        saveTimer = window.setTimeout(() => {
+          saveTimer = null;
+          void saveCurrentTabNow();
+        }, 250);
+      }
+    } else {
+      clearSaveRetry();
+      saveRetryAttempt = 0;
+      setSaveState(text().saved);
+    }
     renderSidebar();
     updateStatus();
+    return dirtyTabIds.size === 0;
   } catch (error) {
     setSaveState(text().autosaveFailed, "error");
     console.error(error);
+    if (options.retry !== false) {
+      scheduleSaveRetry();
+    }
+    return false;
   }
 }
 
@@ -959,6 +1019,8 @@ function scheduleSave(tabId = activePane().activeTabId): void {
   if (tabId) {
     dirtyTabIds.add(tabId);
   }
+  clearSaveRetry();
+  saveRetryAttempt = 0;
   if (saveTimer !== null) {
     window.clearTimeout(saveTimer);
   }
@@ -969,12 +1031,13 @@ function scheduleSave(tabId = activePane().activeTabId): void {
   }, 700);
 }
 
-async function flushSave(): Promise<void> {
+async function flushSave(options: { retry?: boolean } = {}): Promise<boolean> {
   if (saveTimer !== null) {
     window.clearTimeout(saveTimer);
     saveTimer = null;
   }
-  await saveCurrentTabNow();
+  clearSaveRetry();
+  return saveCurrentTabNow(options);
 }
 
 async function backupCurrentTab(): Promise<void> {
@@ -1152,8 +1215,8 @@ function createEditorState(pane: EditorPaneState, content: string): EditorState 
         contentCache.set(pane.activeTabId, updated);
         updateMetaFromDocument(updated);
         update.transactions.forEach((transaction) => syncEditorTransaction(pane, transaction));
-        updateMinimap();
-        updateStatus();
+        scheduleMinimapUpdate();
+        updateStatusLine(updated);
         scheduleSave(updated.id);
       }),
       Prec.highest(
@@ -1180,6 +1243,8 @@ function createEditor(pane: EditorPaneState): void {
     parent: pane.host,
     state: createEditorState(pane, "")
   });
+  pane.host.tabIndex = -1;
+  pane.host.addEventListener("focus", () => pane.view?.focus());
   pane.host.addEventListener("focusin", () => setActivePane(pane.id));
   pane.element.addEventListener("pointerdown", (event) => {
     if ((event.target as HTMLElement).closest(".child-tab-bar")) {
@@ -1197,11 +1262,14 @@ function setPaneEditorContent(pane: EditorPaneState, content: string): void {
   const cached = key ? pane.stateCache.get(key) : null;
   const state = cached?.doc.toString() === content ? cached : createEditorState(pane, content);
   pane.programmaticChange = true;
-  pane.view.setState(state);
-  pane.view.dispatch({ effects: pane.readOnlyCompartment.reconfigure(editorReadOnlyExtensions(pane)) });
-  pane.programmaticChange = false;
-  if (key) {
-    pane.stateCache.set(key, state);
+  try {
+    pane.view.setState(state);
+    pane.view.dispatch({ effects: pane.readOnlyCompartment.reconfigure(editorReadOnlyExtensions(pane)) });
+    if (key) {
+      pane.stateCache.set(key, pane.view.state);
+    }
+  } finally {
+    pane.programmaticChange = false;
   }
   updateMinimap();
 }
@@ -1237,6 +1305,16 @@ function updateMinimap(): void {
     .slice(0, 900)
     .map((line) => line.replace(/\s+/g, " ").slice(0, 46))
     .join("\n");
+}
+
+function scheduleMinimapUpdate(): void {
+  if (minimapTimer !== null) {
+    window.clearTimeout(minimapTimer);
+  }
+  minimapTimer = window.setTimeout(() => {
+    minimapTimer = null;
+    updateMinimap();
+  }, 120);
 }
 
 function countDisplayCharacters(content: string): number {
@@ -1297,7 +1375,7 @@ function updateStatusLine(tab: TabDocument | null = activeDocument()): void {
   ]
     .filter(Boolean)
     .join("    ");
-  statusRight.textContent = `${label.data}: ${dataRoot}    ${workspace.theme === "dark" ? label.dark : label.light} / ${workspace.fontSize}px`;
+  statusRight.textContent = `${workspace.fontSize}px`;
 }
 
 function updateStatus(): void {
@@ -1309,6 +1387,8 @@ function updateStatus(): void {
     activeTitleInput.value = label.noOpenTab;
     activeTitleInput.disabled = true;
     activeMeta.textContent = "";
+    delete activeMeta.dataset.tabId;
+    delete activeTitleInput.dataset.tabId;
     updateStatusLine(null);
     return;
   }
@@ -1318,8 +1398,10 @@ function updateStatus(): void {
   if (document.activeElement !== activeTitleInput) {
     activeTitleInput.value = tab.title;
   }
-  activeTitleInput.disabled = isRemoteInboxTabId(tab.id);
-  activeMeta.textContent = `${tab.id} > ${child.title} / ${lineCount} ${label.lines} / ${countWords(child.content)} ${label.words}`;
+    activeTitleInput.disabled = !bootstrapReadyForClose || workspaceImportedNeedsRestart || workspaceImportInProgress || isRemoteInboxTabId(tab.id);
+  activeTitleInput.dataset.tabId = tab.id;
+  activeMeta.dataset.tabId = tab.id;
+  activeMeta.textContent = `${child.title} / ${lineCount} ${label.lines} / ${countWords(child.content)} ${label.words}`;
   updateStatusLine(tab);
 }
 
@@ -1353,58 +1435,90 @@ function updatePaneTitles(): void {
   (Object.values(panes) as EditorPaneState[]).forEach((pane) => {
     const tab = pane.activeTabId ? contentCache.get(pane.activeTabId) ?? tabIndex.tabs.find((entry) => entry.id === pane.activeTabId) : null;
     if (!tab) {
-      pane.titleElement.textContent = text().noOpenTab;
+      if (document.activeElement !== pane.titleElement) {
+        pane.titleElement.value = text().noOpenTab;
+      }
+      pane.titleElement.disabled = true;
+      delete pane.titleElement.dataset.tabId;
       return;
     }
-    const fullTab = "content" in tab ? ensureTab(tab as TabDocument) : null;
-    const child = fullTab ? childTabForPane(fullTab, pane) : null;
-    pane.titleElement.textContent = child ? `${tab.title} > ${child.title}` : tab.title;
+    if (document.activeElement !== pane.titleElement) {
+      pane.titleElement.value = tab.title;
+    }
+    pane.titleElement.disabled = !bootstrapReadyForClose || workspaceImportedNeedsRestart || workspaceImportInProgress || isRemoteInboxTabId(tab.id);
+    pane.titleElement.dataset.tabId = tab.id;
   });
+}
+
+function childTabBarMarkup(pane: EditorPaneState): string {
+  const tab = pane.activeTabId ? contentCache.get(pane.activeTabId) : null;
+  if (!tab) {
+    return "";
+  }
+  const normalized = ensureTab(tab);
+  const children = getChildTabs(normalized);
+  if (!children.some((child) => child.id === pane.activeChildTabId)) {
+    pane.activeChildTabId = normalized.activeChildTabId ?? MAIN_CHILD_TAB_ID;
+  }
+  return `
+    ${children
+      .map(
+        (child) => `
+          <button type="button" class="child-tab-button ${child.id === pane.activeChildTabId ? "is-active" : ""}" data-action="activate-child-tab" data-pane-id="${pane.id}" data-id="${normalized.id}" data-child-id="${child.id}">
+            ${escapeHtml(child.title)}
+          </button>
+        `
+      )
+      .join("")}
+    ${isRemoteInboxTabId(normalized.id) ? "" : `<button type="button" class="child-tab-add" data-action="new-child-tab" data-pane-id="${pane.id}" data-id="${normalized.id}" title="${escapeHtml(text().newChildTab)}" aria-label="${escapeHtml(text().newChildTab)}">+</button>`}
+  `;
 }
 
 function renderChildTabBars(): void {
   (Object.values(panes) as EditorPaneState[]).forEach((pane) => {
-    const tab = pane.activeTabId ? contentCache.get(pane.activeTabId) : null;
-    if (!tab) {
-      pane.childBar.innerHTML = "";
-      return;
-    }
-    const normalized = ensureTab(tab);
-    const children = getChildTabs(normalized);
-    if (!children.some((child) => child.id === pane.activeChildTabId)) {
-      pane.activeChildTabId = normalized.activeChildTabId ?? MAIN_CHILD_TAB_ID;
-    }
-    pane.childBar.innerHTML = `
-      ${children
-        .map(
-          (child) => `
-            <button type="button" class="child-tab-button ${child.id === pane.activeChildTabId ? "is-active" : ""}" data-action="activate-child-tab" data-pane-id="${pane.id}" data-id="${normalized.id}" data-child-id="${child.id}">
-              ${escapeHtml(child.title)}
-            </button>
-          `
-        )
-        .join("")}
-      ${isRemoteInboxTabId(normalized.id) ? "" : `<button type="button" class="child-tab-add" data-action="new-child-tab" data-pane-id="${pane.id}" data-id="${normalized.id}" title="${escapeHtml(text().newChildTab)}">+</button>`}
-    `;
+    pane.childBar.innerHTML = childTabBarMarkup(pane);
   });
+  singleChildTabBar.innerHTML = childTabBarMarkup(activePane());
 }
 
 function setActivePane(id: PaneId): void {
   activePaneId = id;
   syncActiveTabId();
   (Object.values(panes) as EditorPaneState[]).forEach((pane) => {
-    pane.element.classList.toggle("is-active", pane.id === activePaneId);
+    const active = pane.id === activePaneId;
+    pane.element.classList.toggle("is-active", active);
+    pane.host.dataset.testid = active ? "active-editor-host" : `editor-host-${pane.id}`;
   });
   updateStatus();
 }
 
+function normalizedSplitRatio(): number {
+  const savedRatio = Number.isFinite(workspace.layout.splitRatio) ? workspace.layout.splitRatio : 0.5;
+  return Math.min(0.8, Math.max(0.2, savedRatio));
+}
+
+function clampSplitRatioForWidth(ratio: number, totalWidth: number): number {
+  const usableWidth = Math.max(1, totalWidth - SPLIT_RESIZER_WIDTH);
+  const effectiveMinimumWidth = Math.min(SPLIT_PANE_MIN_WIDTH, usableWidth / 2);
+  const minimumRatio = effectiveMinimumWidth / usableWidth;
+  return Math.min(1 - minimumRatio, Math.max(minimumRatio, ratio));
+}
+
+function applySplitColumns(split = workspace.layout.splitMode === "vertical"): void {
+  if (!split) {
+    editorSplit.style.gridTemplateColumns = "minmax(0, 1fr) 0 0";
+    return;
+  }
+  const displayedRatio = clampSplitRatioForWidth(normalizedSplitRatio(), editorSplit.getBoundingClientRect().width);
+  editorSplit.style.gridTemplateColumns = `minmax(0, ${displayedRatio}fr) ${SPLIT_RESIZER_WIDTH}px minmax(0, ${1 - displayedRatio}fr)`;
+}
+
 function applyEditorLayout(): void {
   const split = workspace.layout.splitMode === "vertical";
+  editorArea.classList.toggle("is-split", split);
   rightPaneElement.hidden = !split;
   splitResizer.hidden = !split;
-  const ratio = Math.min(0.8, Math.max(0.2, workspace.layout.splitRatio || 0.5));
-  workspace.layout.splitRatio = ratio;
-  editorSplit.style.gridTemplateColumns = split ? `minmax(240px, ${ratio}fr) 5px minmax(240px, ${1 - ratio}fr)` : "minmax(0, 1fr) 0 0";
+  applySidebarWidth();
   if (!split && activePaneId === "right") {
     setActivePane("left");
   } else {
@@ -1427,11 +1541,26 @@ function recentClosedTabs(): TabMeta[] {
 function renderSidebar(): void {
   const label = text();
   tabIndex = ensureTabsIndex();
+  const hasOpenTabs = workspace.openedTabIds.some((id) => tabIndex.tabs.some((tab) => tab.id === id));
+  const hasClosedTabs = recentClosedTabs().length > 0;
 
   sidebar.innerHTML = `
     <div class="sidebar-top">
       <div class="pane-title">${label.tabs}</div>
+      <div class="sidebar-actions">
+        <button type="button" class="icon-button" data-action="global-search" title="${escapeHtml(label.globalSearch)}" aria-label="${escapeHtml(label.globalSearch)}">⌕</button>
+        <button type="button" class="icon-button" data-action="new-tab" title="${escapeHtml(label.newTab)}" aria-label="${escapeHtml(label.newTab)}">＋</button>
+      </div>
     </div>
+    ${
+      hasOpenTabs
+        ? ""
+        : `<div class="sidebar-empty-state">
+            <p>${escapeHtml(label.noOpenTab)}</p>
+            <button type="button" class="secondary-button" data-action="new-tab">${escapeHtml(label.newTab)}</button>
+            <button type="button" class="secondary-button" data-action="open-recent" ${hasClosedTabs ? "" : "disabled"}>${escapeHtml(label.recentClosed)}</button>
+          </div>`
+    }
     ${(tabIndex.groups ?? []).map((group) => renderGroupSection(group)).join("")}
     ${renderUngroupedSection()}
   `;
@@ -1459,12 +1588,15 @@ function renderTabRows(tabIds: string[], groupId: string | null): string {
 function renderGroupSection(group: TabGroup): string {
   const rows = group.collapsed ? "" : renderTabRows(group.tabIds, group.id);
   const selected = selectedGroupId === group.id ? "is-selected" : "";
+  const opened = new Set(workspace.openedTabIds);
+  const openCount = group.tabIds.filter((id) => opened.has(id)).length;
 
   return `
     <section class="tab-section group-section ${selected}" data-group-id="${group.id}">
       <button type="button" class="section-header group-header" data-action="toggle-group" data-id="${group.id}" data-group-id="${group.id}" draggable="true">
         <span class="group-toggle-icon">${group.collapsed ? "▶" : "▽"}</span>
-        <span>${escapeHtml(group.title)}</span>
+        <span class="group-name">${escapeHtml(group.title)}</span>
+        <span class="group-count">${openCount} / ${group.tabIds.length}</span>
       </button>
       <div class="tab-list" data-group-id="${group.id}">${rows || (!group.collapsed ? `<div class="empty-list">${text().empty}</div>` : "")}</div>
     </section>
@@ -1473,12 +1605,16 @@ function renderGroupSection(group: TabGroup): string {
 
 function renderUngroupedSection(): string {
   const collapsed = isUngroupedCollapsed();
-  const rows = collapsed ? "" : renderTabRows(tabIndex.ungroupedTabIds ?? [], null);
+  const tabIds = tabIndex.ungroupedTabIds ?? [];
+  const rows = collapsed ? "" : renderTabRows(tabIds, null);
+  const opened = new Set(workspace.openedTabIds);
+  const openCount = tabIds.filter((id) => opened.has(id)).length;
   return `
     <section class="tab-section group-section ${selectedGroupId === null ? "is-selected" : ""}" data-group-id="${UNGROUPED_GROUP_ID}">
       <button type="button" class="section-header group-header" data-action="toggle-group" data-id="${UNGROUPED_GROUP_ID}" data-group-id="${UNGROUPED_GROUP_ID}">
         <span class="group-toggle-icon">${collapsed ? "▶" : "▽"}</span>
-        <span>${escapeHtml(text().ungrouped)}</span>
+        <span class="group-name">${escapeHtml(text().ungrouped)}</span>
+        <span class="group-count">${openCount} / ${tabIds.length}</span>
       </button>
       <div class="tab-list" data-group-id="${UNGROUPED_GROUP_ID}">${rows || (!collapsed ? `<div class="empty-list">${text().empty}</div>` : "")}</div>
     </section>
@@ -1573,7 +1709,10 @@ async function runGlobalSearch(): Promise<void> {
   }
 
   try {
-    await flushSave();
+    if (!(await flushSave({ retry: false }))) {
+      globalSearchSummary.textContent = text().autosaveFailed;
+      return;
+    }
     globalSearchSummary.textContent = text().searchRunning;
     const results = await window.textEditor.searchAllTabs(query);
     if (sequence !== globalSearchSequence) {
@@ -1720,7 +1859,7 @@ function requestTextDialog(title: string, initialValue: string): Promise<string 
     const overlay = document.createElement("div");
     overlay.className = "dialog-overlay";
     overlay.innerHTML = `
-      <form class="app-dialog">
+      <form class="app-dialog" role="dialog" aria-modal="true">
         <div class="dialog-title">${escapeHtml(title)}</div>
         <input class="dialog-input" name="value" value="${escapeHtml(initialValue)}" autocomplete="off" />
         <div class="dialog-actions">
@@ -1761,7 +1900,7 @@ function confirmDialog(message: string, confirmLabel = text().ok): Promise<boole
     const overlay = document.createElement("div");
     overlay.className = "dialog-overlay";
     overlay.innerHTML = `
-      <form class="app-dialog">
+      <form class="app-dialog" role="dialog" aria-modal="true">
         <div class="dialog-title">${escapeHtml(message)}</div>
         <div class="dialog-actions">
           <button type="button" data-dialog-action="cancel">${label.cancel}</button>
@@ -1797,7 +1936,7 @@ function recoveryDialog(): Promise<"restore" | "skip" | "cancel"> {
     const overlay = document.createElement("div");
     overlay.className = "dialog-overlay";
     overlay.innerHTML = `
-      <form class="app-dialog">
+      <form class="app-dialog" role="dialog" aria-modal="true">
         <div class="dialog-title">${escapeHtml(label.recoveryTitle)}</div>
         <p class="dialog-note">${escapeHtml(label.recoveryMessage)}</p>
         <div class="dialog-actions">
@@ -1850,6 +1989,7 @@ function showContextMenu(tabId: string, x: number, y: number): void {
   menu.innerHTML = isRemoteInboxTabId(tabId) ? `
     <button type="button" data-action="open-tab-main" data-id="${tabId}">${label.openInMain}</button>
     <button type="button" data-action="open-tab-sub" data-id="${tabId}">${label.openInSub}</button>
+    <button type="button" data-action="close-tab" data-id="${tabId}">${label.close}</button>
     <button type="button" data-action="clear-remote-inbox" data-id="${tabId}">${workspace.locale === "jp" ? "Remote Inboxをクリア" : "Clear Remote Inbox"}</button>
   ` : `
     <button type="button" data-action="open-tab-main" data-id="${tabId}">${label.openInMain}</button>
@@ -1920,7 +2060,7 @@ function modalBase(title: string, body: string): HTMLDivElement {
   const overlay = document.createElement("div");
   overlay.className = "dialog-overlay";
   overlay.innerHTML = `
-    <div class="app-dialog large-dialog">
+    <div class="app-dialog large-dialog" role="dialog" aria-modal="true">
       <div class="dialog-title">${escapeHtml(title)}</div>
       ${body}
       <div class="dialog-actions">
@@ -1936,6 +2076,87 @@ function modalBase(title: string, body: string): HTMLDivElement {
   overlay.querySelector<HTMLButtonElement>('[data-dialog-action="cancel"]')!.addEventListener("click", () => overlay.remove());
   document.body.appendChild(overlay);
   return overlay;
+}
+
+function lockImportedWorkspace(): void {
+  workspaceImportInProgress = false;
+  workspaceImportedNeedsRestart = true;
+  document.body.classList.add("workspace-import-locked");
+  document.body.classList.remove("workspace-importing");
+  activeTitleInput.disabled = true;
+  (Object.values(panes) as EditorPaneState[]).forEach((pane) => {
+    pane.titleElement.disabled = true;
+    pane.view?.dispatch({ effects: pane.readOnlyCompartment.reconfigure(editorReadOnlyExtensions(pane)) });
+  });
+}
+
+function setWorkspaceImportInProgress(value: boolean): void {
+  workspaceImportInProgress = value;
+  document.body.classList.toggle("workspace-importing", value);
+  (Object.values(panes) as EditorPaneState[]).forEach((pane) => {
+    pane.view?.dispatch({ effects: pane.readOnlyCompartment.reconfigure(editorReadOnlyExtensions(pane)) });
+  });
+  updateStatus();
+}
+
+function showImportProgressDialog(): HTMLElement {
+  document.querySelector(".dialog-overlay")?.remove();
+  const overlay = document.createElement("div");
+  overlay.className = "dialog-overlay import-progress-overlay";
+  overlay.innerHTML = `
+    <div class="app-dialog import-progress-dialog" role="alertdialog" aria-modal="true" aria-labelledby="import-progress-title">
+      <div class="dialog-title" id="import-progress-title">${workspace.locale === "jp" ? "Workspaceをインポート中…" : "Importing workspace…"}</div>
+      <p class="dialog-note">${workspace.locale === "jp" ? "完了するまで編集をロックしています。" : "Editing is locked until the import finishes."}</p>
+    </div>
+  `;
+  document.body.appendChild(overlay);
+  return overlay;
+}
+
+function showImportRestartDialog(backupPathValue?: string): void {
+  document.querySelector(".dialog-overlay")?.remove();
+  const label = text();
+  const overlay = document.createElement("div");
+  overlay.className = "dialog-overlay";
+  overlay.innerHTML = `
+    <div class="app-dialog large-dialog import-restart-dialog" role="dialog" aria-modal="true" aria-labelledby="import-restart-title">
+      <div class="dialog-title" id="import-restart-title">${escapeHtml(label.workspaceImported)}</div>
+      <p class="dialog-note">${escapeHtml(label.restartRequired)}</p>
+      ${backupPathValue ? `<p class="dialog-note">${escapeHtml(label.currentWorkspaceBackup)}: ${escapeHtml(backupPathValue)}</p>` : ""}
+      <p class="dialog-note import-restart-error" aria-live="polite"></p>
+      <div class="dialog-actions">
+        <button type="button" data-import-action="restart">${escapeHtml(label.restartNow)}</button>
+      </div>
+    </div>
+  `;
+  const restartButton = overlay.querySelector<HTMLButtonElement>('[data-import-action="restart"]')!;
+  restartButton.addEventListener("click", () => {
+    restartButton.disabled = true;
+    void window.textEditor.restartApp().then(
+      (started) => {
+        if (started) {
+          return;
+        }
+        restartButton.disabled = false;
+        const errorElement = overlay.querySelector<HTMLElement>(".import-restart-error");
+        if (errorElement) {
+          errorElement.textContent = label.restartFailed;
+        }
+        setSaveState(label.restartFailed, "error");
+      },
+      (error: unknown) => {
+        restartButton.disabled = false;
+        const message = `${label.restartFailed}: ${errorMessage(error)}`;
+        const errorElement = overlay.querySelector<HTMLElement>(".import-restart-error");
+        if (errorElement) {
+          errorElement.textContent = message;
+        }
+        setSaveState(message, "error");
+      }
+    );
+  });
+  document.body.appendChild(overlay);
+  restartButton.focus();
 }
 
 function openSettingsDialog(): void {
@@ -2016,23 +2237,59 @@ function openSettingsDialog(): void {
   overlay.querySelector<HTMLButtonElement>('[data-dialog-action="cancel"]')!.addEventListener("click", () => overlay.remove());
   overlay.querySelector<HTMLFormElement>("form")!.addEventListener("submit", (event) => {
     event.preventDefault();
-    const value = new FormData(event.currentTarget as HTMLFormElement).get("new-tab-template");
-    workspace.newTabTemplate = value === "novel" || value === "reference" || value === "custom" ? value : "simple";
-    workspace.autoContinueLists = Boolean((event.currentTarget as HTMLFormElement).querySelector<HTMLInputElement>('input[name="auto-continue-lists"]')?.checked);
     const form = event.currentTarget as HTMLFormElement;
+    const value = new FormData(form).get("new-tab-template");
+    const newTabTemplate = value === "novel" || value === "reference" || value === "custom" ? value : "simple";
+    const autoContinueLists = Boolean(form.querySelector<HTMLInputElement>('input[name="auto-continue-lists"]')?.checked);
     const port = Number(form.querySelector<HTMLInputElement>('input[name="remote-port"]')?.value);
     const targetTabName = form.querySelector<HTMLInputElement>('input[name="remote-tab"]')?.value.trim() ?? "";
-    const targetTabNames = (form.querySelector<HTMLTextAreaElement>('textarea[name="remote-targets"]')?.value ?? "").split(/\r?\n/).map((name) => name.trim()).filter((name, index, names) => Boolean(name) && name.length <= 120 && !/[\u0000-\u001F\u007F]/.test(name) && names.indexOf(name) === index).slice(0, 30);
+    const configuredTargetNames = (form.querySelector<HTMLTextAreaElement>('textarea[name="remote-targets"]')?.value ?? "").split(/\r?\n/).map((name) => name.trim()).filter((name, index, names) => Boolean(name) && name.length <= 120 && !/[\u0000-\u001F\u007F]/.test(name) && names.indexOf(name) === index);
+    const targetTabNames = [targetTabName, ...configuredTargetNames.filter((name) => name !== targetTabName)].filter(Boolean).slice(0, 30);
     const accessTeamDomain = form.querySelector<HTMLInputElement>('input[name="remote-domain"]')?.value.trim() ?? "";
+    const accessAudience = form.querySelector<HTMLInputElement>('input[name="remote-audience"]')?.value.trim() ?? "";
+    const allowedEmail = form.querySelector<HTMLInputElement>('input[name="remote-email"]')?.value.trim() ?? "";
+    const remoteEnabled = Boolean(form.querySelector<HTMLInputElement>('input[name="remote-enabled"]')?.checked);
+    const includeTimestamp = Boolean(form.querySelector<HTMLInputElement>('input[name="remote-timestamp"]')?.checked);
+    const notifyOnReceive = Boolean(form.querySelector<HTMLInputElement>('input[name="remote-notify"]')?.checked);
     const remoteReadableTabIds = [...form.querySelectorAll<HTMLInputElement>('input[name="remote-readable-tab"]:checked')].map((input) => input.value);
     if (!Number.isInteger(port) || port < 1024 || port > 65535 || !targetTabName || targetTabName.length > 120 || /[\u0000-\u001F\u007F]/.test(targetTabName) || !targetTabNames.length) { setSaveState(workspace.locale === "jp" ? "遠隔書き込みの設定が不正です" : "Remote writing settings are invalid", "error"); return; }
-    workspace.remoteInbox = { enabled: Boolean(form.querySelector<HTMLInputElement>('input[name="remote-enabled"]')?.checked), port, targetTabName, targetTabNames, remoteReadableTabIds, includeTimestamp: Boolean(form.querySelector<HTMLInputElement>('input[name="remote-timestamp"]')?.checked), notifyOnReceive: Boolean(form.querySelector<HTMLInputElement>('input[name="remote-notify"]')?.checked), accessTeamDomain, accessAudience: form.querySelector<HTMLInputElement>('input[name="remote-audience"]')?.value.trim() ?? "", allowedEmail: form.querySelector<HTMLInputElement>('input[name="remote-email"]')?.value.trim() ?? "" };
-    workspace.templates = {
-      ...workspace.templates,
-      custom: [MAIN_CHILD_TAB_TITLE, ...normalizeTemplateTitles(workspace.templates?.custom).slice(1)]
-    };
-    void saveWorkspace().then(() => { (Object.values(panes) as EditorPaneState[]).forEach((pane) => pane.view?.dispatch({ effects: pane.readOnlyCompartment.reconfigure(editorReadOnlyExtensions(pane)) })); setSaveState(label.templateSaved); });
-    overlay.remove();
+    const formControls = [...form.querySelectorAll<HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement | HTMLButtonElement>("input, textarea, select, button")];
+    const setFormDisabled = (disabled: boolean): void => formControls.forEach((control) => { control.disabled = disabled; });
+    setFormDisabled(true);
+    void (async () => {
+      if (!(await flushSave({ retry: false }))) {
+        setFormDisabled(false);
+        return;
+      }
+      const duplicateRemoteTarget = targetTabNames.find((name) => tabIndex.tabs.filter((tab) => tab.title === name).length > 1);
+      if (duplicateRemoteTarget) {
+        setSaveState(
+          workspace.locale === "jp"
+            ? `受信先「${duplicateRemoteTarget}」と同名のタブが複数あります`
+            : `Multiple tabs use the Remote Inbox target name "${duplicateRemoteTarget}"`,
+          "error"
+        );
+        setFormDisabled(false);
+        return;
+      }
+      workspace.newTabTemplate = newTabTemplate;
+      workspace.autoContinueLists = autoContinueLists;
+      workspace.remoteInbox = { enabled: remoteEnabled, port, targetTabName, targetTabNames, remoteReadableTabIds, includeTimestamp, notifyOnReceive, accessTeamDomain, accessAudience, allowedEmail };
+      workspace.templates = {
+        ...workspace.templates,
+        custom: [MAIN_CHILD_TAB_TITLE, ...normalizeTemplateTitles(workspace.templates?.custom).slice(1)]
+      };
+      try {
+        await saveWorkspace();
+        (Object.values(panes) as EditorPaneState[]).forEach((pane) => pane.view?.dispatch({ effects: pane.readOnlyCompartment.reconfigure(editorReadOnlyExtensions(pane)) }));
+        updateStatus();
+        setSaveState(label.templateSaved);
+        overlay.remove();
+      } catch (error) {
+        setFormDisabled(false);
+        setSaveState(`${text().actionFailed}: ${errorMessage(error)}`, "error");
+      }
+    })();
   });
   document.body.appendChild(overlay);
 }
@@ -2304,17 +2561,30 @@ async function applyTabTitle(id: string, title: string): Promise<void> {
     updateStatus();
     return;
   }
+  const remoteTargetNames = new Set([workspace.remoteInbox.targetTabName, ...workspace.remoteInbox.targetTabNames]);
+  if (remoteTargetNames.has(nextTitle) && tabIndex.tabs.some((entry) => entry.id !== id && entry.title === nextTitle)) {
+    setSaveState(
+      workspace.locale === "jp"
+        ? "Remote Inbox の受信先と同名のタブが既にあります"
+        : "A tab with this Remote Inbox target name already exists",
+      "error"
+    );
+    updateStatus();
+    return;
+  }
 
   const tab = await loadTabToCache(id);
   tab.title = nextTitle;
   tab.updatedAt = nowIso();
   contentCache.set(id, tab);
-  const savedVersion = tab.updatedAt;
-  const saved = ensureTab(await window.textEditor.saveTab(tab));
-  const latest = contentCache.get(id);
-  const current = latest && latest.updatedAt !== savedVersion ? ensureTab({ ...latest, title: saved.title }) : saved;
-  contentCache.set(id, current);
-  updateMetaFromDocument(current);
+  updateMetaFromDocument(tab);
+  scheduleSave(id);
+  if (!(await flushSave())) {
+    renderSidebar();
+    updatePaneTitles();
+    updateStatus();
+    return;
+  }
   renderSidebar();
   updatePaneTitles();
   updateStatus();
@@ -2336,6 +2606,36 @@ async function commitActiveTitle(): Promise<void> {
   }
 }
 
+async function commitPaneTitle(input: HTMLInputElement): Promise<void> {
+  const id = input.dataset.tabId;
+  if (!id) {
+    return;
+  }
+  const tab = await loadTabToCache(id);
+  const nextTitle = input.value.trim();
+  if (!nextTitle) {
+    input.value = input.dataset.titleBeforeEdit || tab.title;
+    return;
+  }
+  if (nextTitle !== tab.title) {
+    await applyTabTitle(id, nextTitle);
+  }
+}
+
+function focusTitleForPane(paneId: PaneId, select = false): void {
+  const input = workspace.layout.splitMode === "vertical" ? paneForId(paneId).titleElement : activeTitleInput;
+  if (input.disabled) {
+    paneForId(paneId).view?.focus();
+    return;
+  }
+  window.setTimeout(() => {
+    input.focus();
+    if (select) {
+      input.select();
+    }
+  }, 0);
+}
+
 async function loadTabToCache(id: string): Promise<TabDocument> {
   const cached = contentCache.get(id);
   if (cached) {
@@ -2348,8 +2648,12 @@ async function loadTabToCache(id: string): Promise<TabDocument> {
 
 async function activateTab(id: string, options: { flushCurrent?: boolean; childTabId?: string } = {}): Promise<void> {
   const pane = activePane();
-  if (pane.activeTabId === id && contentCache.has(id) && (!options.childTabId || pane.activeChildTabId === options.childTabId)) {
-    return;
+  const cachedTab = contentCache.get(id);
+  if (pane.activeTabId === id && cachedTab && (!options.childTabId || pane.activeChildTabId === options.childTabId)) {
+    const cachedChild = childTabForPane(cachedTab, pane);
+    if (pane.view?.state.doc.toString() === cachedChild.content && !pane.host.classList.contains("is-empty")) {
+      return;
+    }
   }
   if (options.flushCurrent !== false) {
     await flushSave();
@@ -2430,6 +2734,7 @@ async function createNewTab(targetGroupIdOverride?: string | null): Promise<void
     await saveWorkspace();
     renderSidebar();
     setSaveState(text().newTabCreated);
+    focusTitleForPane(activePaneId, true);
   } catch (error) {
     setSaveState(`${text().newTabFailed}: ${errorMessage(error)}`, "error");
     console.error(error);
@@ -2683,7 +2988,9 @@ async function toggleGroup(id: string): Promise<void> {
 }
 
 async function closeTab(id: string): Promise<void> {
-  await flushSave();
+  if (!(await flushSave({ retry: false }))) {
+    return;
+  }
   const affectedPanes = (Object.values(panes) as EditorPaneState[]).filter((pane) => pane.activeTabId === id);
   workspace.openedTabIds = workspace.openedTabIds.filter((entry) => entry !== id);
   workspace.recentTabIds = [id, ...workspace.recentTabIds.filter((entry) => entry !== id)].slice(0, 20);
@@ -2763,7 +3070,9 @@ async function togglePinTab(id: string): Promise<void> {
 }
 
 async function duplicateTab(id: string): Promise<void> {
-  await flushSave();
+  if (!(await flushSave({ retry: false }))) {
+    return;
+  }
   const source = await loadTabToCache(id);
   const newId = nextTabId();
   const updatedAt = nowIso();
@@ -2835,6 +3144,9 @@ async function deleteTab(id: string): Promise<void> {
   if (!(await confirmDialog(text().deleteConfirm(meta?.title ?? id), text().delete))) {
     return;
   }
+  if (!(await flushSave({ retry: false }))) {
+    return;
+  }
 
   tabIndex = normalizeTabsIndex(await window.textEditor.deleteTab(id));
   contentCache.delete(id);
@@ -2860,7 +3172,9 @@ async function deleteTab(id: string): Promise<void> {
 }
 
 async function exportCurrentTxt(): Promise<void> {
-  await flushSave();
+  if (!(await flushSave({ retry: false }))) {
+    return;
+  }
   const tab = activeDocument();
   if (!tab) {
     return;
@@ -2880,7 +3194,9 @@ async function exportCurrentTxt(): Promise<void> {
 }
 
 async function exportAllTxt(): Promise<void> {
-  await flushSave();
+  if (!(await flushSave({ retry: false }))) {
+    return;
+  }
   try {
     const result = await window.textEditor.exportAllTxt();
     if (!result.canceled && result.filePath) {
@@ -2900,7 +3216,9 @@ async function exportAllTxt(): Promise<void> {
 }
 
 async function exportWorkspace(): Promise<void> {
-  await flushSave();
+  if (!(await flushSave({ retry: false }))) {
+    return;
+  }
   try {
     const result = await window.textEditor.exportWorkspace();
     if (!result.canceled && result.filePath) {
@@ -2912,18 +3230,29 @@ async function exportWorkspace(): Promise<void> {
 }
 
 async function importWorkspace(): Promise<void> {
-  await flushSave();
+  if (!(await flushSave({ retry: false }))) {
+    return;
+  }
+  setWorkspaceImportInProgress(true);
+  const progressOverlay = showImportProgressDialog();
   try {
     const result = await window.textEditor.importWorkspace();
-    if (!result.canceled) {
-      workspaceImportedNeedsRestart = true;
-      setSaveState(text().workspaceImported);
-      const backupLine = result.backupPath
-        ? `<p class="dialog-note">${escapeHtml(text().currentWorkspaceBackup)}: ${escapeHtml(result.backupPath)}</p>`
-        : "";
-      modalBase(text().workspaceImported, `<p class="dialog-note">${escapeHtml(text().restartRequired)}</p>${backupLine}`);
+    progressOverlay.remove();
+    if (result.canceled) {
+      setWorkspaceImportInProgress(false);
+      return;
     }
+    lockImportedWorkspace();
+    setSaveState(
+      result.error ? `${text().importWorkspaceFailed}: ${result.error}` : text().workspaceImported,
+      result.error ? "error" : "idle"
+    );
+    showImportRestartDialog(result.backupPath);
   } catch (error) {
+    progressOverlay.remove();
+    if (!workspaceImportedNeedsRestart) {
+      setWorkspaceImportInProgress(false);
+    }
     setSaveState(`${text().importWorkspaceFailed}: ${errorMessage(error)}`, "error");
   }
 }
@@ -2983,6 +3312,8 @@ async function applyThemeAndFont(): Promise<void> {
 function applyLocale(): void {
   document.documentElement.lang = workspace.locale === "jp" ? "ja" : "en";
   document.body.dataset.locale = workspace.locale;
+  leftEditorHost.dataset.emptyLabel = text().noOpenTab;
+  rightEditorHost.dataset.emptyLabel = text().noOpenTab;
   updateGlobalSearchLabels();
 }
 
@@ -3063,8 +3394,15 @@ function focusEditorPane(id: PaneId): void {
 function applySidebarWidth(): void {
   const width = Math.min(420, Math.max(160, workspace.sidebarWidth || defaultWorkspace.sidebarWidth));
   workspace.sidebarWidth = width;
-  const searchWidth = searchPanel.hidden ? 0 : 300;
-  workspaceElement.style.gridTemplateColumns = `${width}px ${searchWidth}px 5px minmax(0, 1fr) 86px`;
+  const narrowSearch = !searchPanel.hidden && window.innerWidth < 980;
+  const sidebarWidth = narrowSearch ? 0 : width;
+  const searchWidth = searchPanel.hidden ? 0 : narrowSearch ? Math.min(320, Math.max(240, Math.floor(window.innerWidth * 0.38))) : 300;
+  const splitAllowsMinimap = workspace.layout.splitMode !== "vertical" || window.innerWidth >= 1350;
+  const minimapVisible = splitAllowsMinimap && window.innerWidth >= 1050 && (searchPanel.hidden || window.innerWidth >= 1350);
+  workspaceElement.classList.toggle("is-search-narrow", narrowSearch);
+  workspaceElement.classList.toggle("is-minimap-hidden", !minimapVisible);
+  workspaceElement.style.gridTemplateColumns = `${sidebarWidth}px ${searchWidth}px 5px minmax(0, 1fr) ${minimapVisible ? 86 : 0}px`;
+  applySplitColumns();
 }
 
 function setupSplitResize(): void {
@@ -3084,9 +3422,11 @@ function setupSplitResize(): void {
       return;
     }
     const rect = editorSplit.getBoundingClientRect();
-    const ratio = (event.clientX - rect.left) / Math.max(1, rect.width);
-    workspace.layout.splitRatio = Math.min(0.8, Math.max(0.2, ratio));
-    applyEditorLayout();
+    const usableWidth = Math.max(1, rect.width - SPLIT_RESIZER_WIDTH);
+    const requestedRatio = (event.clientX - rect.left) / usableWidth;
+    const normalizedRatio = Math.min(0.8, Math.max(0.2, requestedRatio));
+    workspace.layout.splitRatio = clampSplitRatioForWidth(normalizedRatio, rect.width);
+    applySplitColumns(true);
   });
 
   const finish = (event: PointerEvent): void => {
@@ -3148,6 +3488,13 @@ async function performAction(
 ): Promise<void> {
   const { id, childId, paneId, fileName, source } = options;
 
+  if (!bootstrapReadyForClose && action !== "reload-app") {
+    return;
+  }
+  if ((workspaceImportedNeedsRestart || workspaceImportInProgress) && action !== "reload-app") {
+    return;
+  }
+
   if (action === "new-tab") await createNewTab();
   else if (action === "new-group") await createGroup();
   else if (action === "new-tab-in-group") await createNewTab(id === UNGROUPED_GROUP_ID ? null : id ?? null);
@@ -3167,6 +3514,7 @@ async function performAction(
   else if (action === "close-split") await closeSplit();
   else if (action === "focus-left") focusEditorPane("left");
   else if (action === "focus-right") focusEditorPane("right");
+  else if (action === "reload-app") await window.textEditor.reloadApp();
   else if (action === "undo" || action === "redo" || action === "find" || action === "replace" || action === "find-next" || action === "find-previous") {
     runEditorCommand(action);
   } else if (action === "toggle-theme") {
@@ -3464,7 +3812,11 @@ document.addEventListener("keydown", (event) => {
 
   if (event.key === "Escape") {
     closeContextMenu();
-    document.querySelector(".dialog-overlay")?.remove();
+    const overlay = document.querySelector<HTMLElement>(".dialog-overlay");
+    const cancelButton = overlay?.querySelector<HTMLButtonElement>(
+      '[data-dialog-action="cancel"], [data-recovery-action="cancel"]'
+    );
+    cancelButton?.click();
     if (document.activeElement === activeTitleInput) {
       activeTitleInput.value = titleBeforeEdit;
       activeTitleInput.blur();
@@ -3480,11 +3832,37 @@ activeTitleInput.addEventListener("keydown", (event) => {
   if (event.key === "Enter") {
     event.preventDefault();
     activeTitleInput.blur();
+    activePane().view?.focus();
   }
 });
 
 activeTitleInput.addEventListener("blur", () => {
   void commitActiveTitle();
+});
+
+document.querySelectorAll<HTMLInputElement>(".pane-title-input").forEach((input) => {
+  input.addEventListener("focus", () => {
+    input.dataset.titleBeforeEdit = input.value;
+    setActivePane(input.dataset.paneId === "right" ? "right" : "left");
+  });
+  input.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      input.blur();
+      paneForId(input.dataset.paneId === "right" ? "right" : "left").view?.focus();
+    } else if (event.key === "Escape") {
+      event.preventDefault();
+      input.value = input.dataset.titleBeforeEdit || input.value;
+      input.blur();
+    }
+  });
+  input.addEventListener("blur", () => {
+    void commitPaneTitle(input);
+  });
+});
+
+window.addEventListener("resize", () => {
+  applySidebarWidth();
 });
 
 window.textEditor.onMenuAction((action: MenuAction) => {
@@ -3499,25 +3877,46 @@ window.textEditor.onMenuAction((action: MenuAction) => {
 });
 
 window.addEventListener("texteditor:workspace-imported", () => {
-  workspaceImportedNeedsRestart = true;
+  lockImportedWorkspace();
+});
+
+window.textEditor.onBeforeClose(async () => {
+  if (workspaceImportInProgress) {
+    return {
+      ok: false,
+      error: workspace.locale === "jp" ? "Workspaceのインポート処理中です" : "Workspace import is still in progress"
+    };
+  }
+  if (workspaceImportedNeedsRestart || !appStateLoaded) {
+    return { ok: true };
+  }
+  if (!bootstrapReadyForClose) {
+    const saved = await flushSave({ retry: false });
+    return saved ? { ok: true } : { ok: false, error: text().autosaveFailed };
+  }
+  const saved = await flushSave({ retry: false });
+  if (!saved) {
+    return { ok: false, error: text().autosaveFailed };
+  }
+  try {
+    syncActiveTabId();
+    await saveWorkspace();
+    return { ok: true };
+  } catch (error) {
+    const message = errorMessage(error);
+    setSaveState(`${text().autosaveFailed}: ${message}`, "error");
+    return { ok: false, error: message };
+  }
 });
 
 window.addEventListener("beforeunload", () => {
-  if (workspaceImportedNeedsRestart) {
-    return;
-  }
   if (saveTimer !== null) {
     window.clearTimeout(saveTimer);
   }
-  const ids = new Set([...dirtyTabIds, panes.left.activeTabId, panes.right.activeTabId].filter((id): id is string => Boolean(id)));
-  ids.forEach((id) => {
-    const tab = contentCache.get(id);
-    if (tab) {
-      void window.textEditor.saveTab(tab);
-    }
-  });
-  syncActiveTabId();
-  void window.textEditor.saveWorkspace(workspace);
+  if (minimapTimer !== null) {
+    window.clearTimeout(minimapTimer);
+  }
+  clearSaveRetry();
 });
 
 function remoteTimestamp(): string {
@@ -3526,9 +3925,44 @@ function remoteTimestamp(): string {
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
 }
 
+const remoteOperationQueues = new Map<string, Promise<void>>();
+
+function remoteTargetMatches(targetTabName: string): TabMeta[] {
+  return tabIndex.tabs.filter((entry) => entry.title === targetTabName.trim());
+}
+
+function duplicateRemoteTargetError(targetTabName: string): string {
+  return workspace.locale === "jp"
+    ? `受信先「${targetTabName}」と同名のタブが複数あるため、Remote Inboxの操作を中止しました`
+    : `Remote Inbox stopped because multiple tabs use the target name "${targetTabName}"`;
+}
+
+function enqueueRemoteOperation<T>(targetTabName: string, operation: () => Promise<T>): Promise<T> {
+  const previous = remoteOperationQueues.get(targetTabName) ?? Promise.resolve();
+  const result = previous.catch(() => undefined).then(operation);
+  const completion = result.then(
+    () => undefined,
+    () => undefined
+  );
+  remoteOperationQueues.set(targetTabName, completion);
+  void completion.finally(() => {
+    if (remoteOperationQueues.get(targetTabName) === completion) {
+      remoteOperationQueues.delete(targetTabName);
+    }
+  });
+  return result;
+}
+
 async function appendRemoteInbox(textValue: string, includeTimestamp: boolean, targetTabName: string): Promise<void> {
+  if (!bootstrapReadyForClose || workspaceImportedNeedsRestart || workspaceImportInProgress) {
+    throw new Error(bootstrapReadyForClose ? "Workspace restart required" : "Workspace is still loading");
+  }
   const title = targetTabName.trim();
-  let meta = tabIndex.tabs.find((entry) => entry.title === title);
+  const matches = remoteTargetMatches(title);
+  if (matches.length > 1) {
+    throw new Error(duplicateRemoteTargetError(title));
+  }
+  const meta: TabMeta | undefined = matches[0];
   let tab: TabDocument;
   if (meta) {
     tab = await loadTabToCache(meta.id);
@@ -3547,7 +3981,6 @@ async function appendRemoteInbox(textValue: string, includeTimestamp: boolean, t
     workspace.openedTabIds = workspace.openedTabIds.includes(id) ? workspace.openedTabIds : [...workspace.openedTabIds, id];
     workspace.recentTabIds = [id, ...workspace.recentTabIds.filter((tabId) => tabId !== id)];
     await saveWorkspace();
-    meta = tabIndex.tabs.find((entry) => entry.id === id);
   }
   const main = getMainChildTab(tab);
   const entry = includeTimestamp ? `[${remoteTimestamp()}]\n${textValue}` : textValue;
@@ -3555,28 +3988,31 @@ async function appendRemoteInbox(textValue: string, includeTimestamp: boolean, t
   const updated = setChildContent(tab, MAIN_CHILD_TAB_ID, content);
   updated.updatedAt = nowIso();
   updated.revision = (tab.revision ?? 0) + 1;
-  contentCache.set(updated.id, updated);
-  updateMetaFromDocument(updated);
+  const saved = ensureTab(await window.textEditor.saveTab(updated));
+  contentCache.set(saved.id, saved);
+  updateMetaFromDocument(saved);
   for (const pane of Object.values(panes) as EditorPaneState[]) {
-    if (pane.activeTabId !== updated.id || pane.activeChildTabId !== MAIN_CHILD_TAB_ID || !pane.view) continue;
+    if (pane.activeTabId !== saved.id || pane.activeChildTabId !== MAIN_CHILD_TAB_ID || !pane.view) continue;
     pane.programmaticChange = true;
     pane.view.dispatch({ changes: { from: pane.view.state.doc.length, insert: `${pane.view.state.doc.length ? "\n\n" : ""}${entry}` }, annotations: Transaction.addToHistory.of(false) });
     pane.programmaticChange = false;
     cachePaneEditorState(pane);
   }
-  const saved = ensureTab(await window.textEditor.saveTab(updated));
-  const latest = contentCache.get(updated.id);
-  if (latest && latest.updatedAt !== updated.updatedAt) return;
-  contentCache.set(saved.id, saved);
-  updateMetaFromDocument(saved);
   dirtyTabIds.delete(saved.id);
   renderSidebar();
   updateStatus();
 }
 
 async function mutateRemoteInbox(operation: "replace" | "clear", targetTabName: string, contentValue: string, expectedRevision: number): Promise<{ ok: true; tabId: string; content: string; revision: number; updatedAt: string; beforeCharacters: number } | { ok: false; error: string; conflict?: boolean; tabId?: string; revision?: number; updatedAt?: string }> {
+  if (!bootstrapReadyForClose || workspaceImportedNeedsRestart || workspaceImportInProgress) {
+    return { ok: false, error: bootstrapReadyForClose ? "Workspace restart required" : "Workspace is still loading" };
+  }
   const title = targetTabName.trim();
-  let meta = tabIndex.tabs.find((entry) => entry.title === title);
+  const matches = remoteTargetMatches(title);
+  if (matches.length > 1) {
+    return { ok: false, error: duplicateRemoteTargetError(title) };
+  }
+  const meta: TabMeta | undefined = matches[0];
   let tab: TabDocument;
   if (meta) {
     tab = await loadTabToCache(meta.id);
@@ -3593,7 +4029,6 @@ async function mutateRemoteInbox(operation: "replace" | "clear", targetTabName: 
     workspace.openedTabIds = workspace.openedTabIds.includes(id) ? workspace.openedTabIds : [...workspace.openedTabIds, id];
     workspace.recentTabIds = [id, ...workspace.recentTabIds.filter((tabId) => tabId !== id)];
     await saveWorkspace();
-    meta = tabIndex.tabs.find((entry) => entry.id === id);
   }
   const currentRevision = tab.revision ?? 0;
   if (currentRevision !== expectedRevision) return { ok: false, error: "Revision conflict", conflict: true, tabId: tab.id, revision: currentRevision, updatedAt: tab.updatedAt };
@@ -3617,28 +4052,68 @@ async function mutateRemoteInbox(operation: "replace" | "clear", targetTabName: 
 async function clearRemoteInboxTab(id: string): Promise<void> {
   if (!isRemoteInboxTabId(id)) return;
   const tab = await loadTabToCache(id);
+  if (remoteTargetMatches(tab.title).length > 1) {
+    throw new Error(duplicateRemoteTargetError(tab.title));
+  }
   const confirmed = window.confirm(workspace.locale === "jp" ? "Remote Inboxの内容をすべて削除します。\nこの操作は元に戻せません。" : "Delete all Remote Inbox content.\nThis action cannot be undone.");
   if (!confirmed) return;
-  const result = await mutateRemoteInbox("clear", tab.title, "", tab.revision ?? 0);
+  const result = await enqueueRemoteOperation(tab.title, () => mutateRemoteInbox("clear", tab.title, "", tab.revision ?? 0));
   if (!result.ok) throw new Error(result.error);
   await window.textEditor.auditRemoteInboxPcClear({ tabId: result.tabId, targetTabName: tab.title, revision: result.revision, beforeCharacters: result.beforeCharacters });
 }
 
-window.textEditor.onRemoteInboxAppend(async (request) => appendRemoteInbox(request.text, request.includeTimestamp, request.targetTabName));
-window.textEditor.onRemoteInboxMutate(async (request) => mutateRemoteInbox(request.operation, request.targetTabName, request.content, request.revision));
+window.textEditor.onRemoteInboxAppend(async (request) =>
+  enqueueRemoteOperation(request.targetTabName, () => appendRemoteInbox(request.text, request.includeTimestamp, request.targetTabName))
+);
+window.textEditor.onRemoteInboxMutate(async (request) =>
+  enqueueRemoteOperation(request.targetTabName, () => mutateRemoteInbox(request.operation, request.targetTabName, request.content, request.revision))
+);
+
+function hydratePaneFromCache(pane: EditorPaneState): void {
+  const tab = pane.activeTabId ? contentCache.get(pane.activeTabId) : null;
+  if (!tab) {
+    setPaneEditorContent(pane, "");
+    setPaneEditorEnabled(pane, false);
+    return;
+  }
+  setPaneEditorContent(pane, childTabForPane(tab, pane).content);
+  setPaneEditorEnabled(pane, true);
+}
+
+function finishBootstrap(focusNewTitle = false): void {
+  bootstrapReadyForClose = true;
+  try {
+    (Object.values(panes) as EditorPaneState[]).forEach(hydratePaneFromCache);
+    updateStatus();
+    document.body.dataset.appReady = "true";
+  } catch (error) {
+    bootstrapReadyForClose = false;
+    document.body.dataset.appReady = "error";
+    (Object.values(panes) as EditorPaneState[]).forEach((pane) => {
+      pane.view?.dispatch({ effects: pane.readOnlyCompartment.reconfigure(editorReadOnlyExtensions(pane)) });
+    });
+    throw error;
+  }
+  if (focusNewTitle) {
+    focusTitleForPane(activePaneId, true);
+  }
+}
 
 async function bootstrap(): Promise<void> {
-  createEditor(panes.left);
-  createEditor(panes.right);
-  setupSidebarResize();
-  setupSplitResize();
-  const snapshot = await window.textEditor.loadApp();
-  workspace = snapshot.workspace;
-  tabIndex = normalizeTabsIndex(snapshot.tabIndex);
-  dataRoot = snapshot.dataRoot;
-  shell.dataset.theme = workspace.theme;
-  document.body.dataset.theme = workspace.theme;
-  applyLocale();
+  let completed = false;
+  let focusNewTitle = false;
+  try {
+    createEditor(panes.left);
+    createEditor(panes.right);
+    setupSidebarResize();
+    setupSplitResize();
+    const snapshot = await window.textEditor.loadApp();
+    workspace = snapshot.workspace;
+    tabIndex = normalizeTabsIndex(snapshot.tabIndex);
+    appStateLoaded = true;
+    shell.dataset.theme = workspace.theme;
+    document.body.dataset.theme = workspace.theme;
+    applyLocale();
 
   if (snapshot.recovery?.abnormalShutdown) {
     const choice = await recoveryDialog();
@@ -3670,10 +4145,12 @@ async function bootstrap(): Promise<void> {
     });
   });
 
-  if (tabIndex.tabs.length === 0) {
-    await createNewTab();
-    return;
-  }
+    if (tabIndex.tabs.length === 0) {
+      await createNewTab();
+      focusNewTitle = true;
+      completed = true;
+      return;
+    }
 
   workspace.openedTabIds = workspace.openedTabIds.filter((id) => tabIndex.tabs.some((tab) => tab.id === id));
   workspace.recentTabIds = workspace.recentTabIds.filter((id) => tabIndex.tabs.some((tab) => tab.id === id));
@@ -3702,10 +4179,17 @@ async function bootstrap(): Promise<void> {
     setPaneEditorEnabled(panes.right, false);
     updateStatus();
   }
-  setSaveState(text().saved);
+    setSaveState(text().saved);
+    completed = true;
+  } finally {
+    if (completed) {
+      finishBootstrap(focusNewTitle);
+    }
+  }
 }
 
 void bootstrap().catch((error) => {
   console.error(error);
+  document.body.dataset.appReady = "error";
   setSaveState(`${text().startupFailed}: ${errorMessage(error)}`, "error");
 });

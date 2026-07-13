@@ -87,9 +87,12 @@ button:hover {
 }
 
 .save-state {
-  margin-left: auto;
-  color: var(--muted);
-  font-size: 12px;
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
 }
 
 .save-state[data-mode="dirty"] {
@@ -102,9 +105,13 @@ button:hover {
 
 .workspace {
   display: grid;
-  grid-template-columns: 248px 5px minmax(0, 1fr) 86px;
+  grid-template-columns: 248px 0 5px minmax(0, 1fr) 86px;
   min-height: 0;
   border-top: 1px solid var(--border);
+}
+
+body:not([data-app-ready="true"]) .workspace {
+  pointer-events: none;
 }
 
 .sidebar {
@@ -237,10 +244,33 @@ body.is-resizing {
 .sidebar-top {
   display: flex;
   align-items: center;
-  justify-content: flex-start;
+  justify-content: space-between;
   height: 34px;
   padding: 0 12px;
   border-bottom: 1px solid var(--border);
+}
+
+.sidebar-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.sidebar-empty-state {
+  display: grid;
+  gap: 8px;
+  padding: 14px 12px;
+  border-bottom: 1px solid var(--border);
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.sidebar-empty-state p {
+  margin: 0 0 2px;
+}
+
+.sidebar-empty-state .secondary-button {
+  justify-self: stretch;
 }
 
 .pane-title {
@@ -306,6 +336,22 @@ body.is-resizing {
   font-size: 12px;
   font-weight: 600;
   text-align: left;
+}
+
+.group-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.group-count {
+  flex: 0 0 auto;
+  margin-left: auto;
+  color: var(--muted);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  font-weight: 400;
 }
 
 .group-toggle-icon {
@@ -419,8 +465,17 @@ body.is-resizing {
   background: var(--bg);
 }
 
+.editor-area.is-split {
+  grid-template-rows: 0 minmax(0, 1fr);
+}
+
+.editor-area.is-split .editor-header {
+  display: none;
+}
+
 .editor-split {
   display: grid;
+  grid-row: 2;
   grid-template-columns: minmax(0, 1fr) 0 0;
   min-width: 0;
   min-height: 0;
@@ -428,11 +483,15 @@ body.is-resizing {
 
 .editor-pane {
   display: grid;
-  grid-template-rows: 54px minmax(0, 1fr);
+  grid-template-rows: 0 minmax(0, 1fr);
   min-width: 0;
   min-height: 0;
   border: 1px solid transparent;
   background: var(--bg);
+}
+
+.editor-area.is-split .editor-pane {
+  grid-template-rows: 50px minmax(0, 1fr);
 }
 
 .editor-pane[hidden],
@@ -445,18 +504,32 @@ body.is-resizing {
 }
 
 .pane-editor-header {
-  display: grid;
-  grid-template-rows: 24px 28px;
+  display: none;
+  grid-template-rows: 24px 24px;
   align-items: center;
   min-width: 0;
+  overflow: hidden;
   padding: 0 8px;
   border-bottom: 1px solid var(--border);
   background: var(--bg);
 }
 
+.editor-area.is-split .pane-editor-header {
+  display: grid;
+}
+
 .pane-editor-title {
+  width: 100%;
+  min-width: 0;
+  height: 22px;
+  padding: 0 3px;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  outline: none;
+  background: transparent;
   overflow: hidden;
   color: var(--muted);
+  font: inherit;
   font-size: 12px;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -466,10 +539,21 @@ body.is-resizing {
   color: var(--text);
 }
 
+.pane-editor-title:hover:not(:disabled),
+.pane-editor-title:focus {
+  border-color: var(--border);
+  background: var(--panel);
+}
+
+.pane-editor-title:disabled {
+  opacity: 1;
+}
+
 .child-tab-bar {
   display: flex;
   align-items: center;
   gap: 4px;
+  max-width: 100%;
   min-width: 0;
   overflow-x: auto;
   overflow-y: hidden;
@@ -517,9 +601,10 @@ body.is-split-resizing {
 }
 
 .editor-header {
-  display: flex;
+  display: grid;
+  grid-template-columns: minmax(160px, min(38%, 520px)) minmax(0, 1fr);
   align-items: center;
-  justify-content: space-between;
+  gap: 14px;
   padding: 0 16px;
   border-bottom: 1px solid var(--border);
   background: var(--bg);
@@ -530,7 +615,7 @@ body.is-split-resizing {
 }
 
 .active-title-input {
-  width: min(520px, 55vw);
+  width: 100%;
   height: 24px;
   padding: 0 4px;
   border: 1px solid transparent;
@@ -540,6 +625,10 @@ body.is-split-resizing {
   color: var(--text);
   font-size: 14px;
   font-weight: 600;
+}
+
+.single-child-tab-bar {
+  justify-content: flex-start;
 }
 
 .active-title-input:hover,
@@ -572,7 +661,7 @@ body.is-split-resizing {
 }
 
 .editor-host.is-empty::before {
-  content: "No open tab";
+  content: attr(data-empty-label);
   display: block;
   padding: 24px;
   color: var(--muted);
@@ -588,6 +677,16 @@ body.is-split-resizing {
   padding: 8px 5px;
   background: var(--panel);
   border-left: 1px solid var(--border);
+}
+
+.workspace.is-minimap-hidden .minimap-panel {
+  display: none;
+}
+
+.workspace.is-search-narrow .sidebar {
+  visibility: hidden;
+  overflow: hidden;
+  pointer-events: none;
 }
 
 #minimap {
@@ -659,6 +758,10 @@ body.is-split-resizing {
   font-size: 12px;
   line-height: 1.5;
   word-break: break-all;
+}
+
+.import-restart-error {
+  color: var(--danger);
 }
 
 .dialog-input {
@@ -750,6 +853,11 @@ body.is-split-resizing {
   font-size: 12px;
 }
 
+.secondary-button:disabled {
+  cursor: default;
+  opacity: 0.45;
+}
+
 .template-editor-list {
   display: grid;
   gap: 6px;
@@ -793,14 +901,20 @@ body.is-split-resizing {
   font-size: 13px;
 }
 
-.settings-field input {
+.settings-field input,
+.settings-field textarea {
   width: 100%;
   box-sizing: border-box;
   padding: 8px;
   border: 1px solid var(--border);
   border-radius: 4px;
-  background: var(--input-bg);
+  background: var(--bg);
   color: var(--text);
+  font: inherit;
+}
+
+.settings-field textarea {
+  resize: vertical;
 }
 
 .modal-list {
@@ -864,9 +978,17 @@ body.is-split-resizing {
   color: var(--danger);
 }
 
+button:focus-visible,
+input:focus-visible,
+textarea:focus-visible,
+select:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
 @media (max-width: 900px) {
   .workspace {
-    grid-template-columns: 210px 0 5px minmax(0, 1fr) 56px;
+    grid-template-columns: 210px 0 5px minmax(0, 1fr) 0;
   }
 
   .menu-label {

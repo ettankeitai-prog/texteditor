@@ -1,8 +1,8 @@
 import AdmZip from "adm-zip";
 import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, Notification } from "electron";
 import type { OpenDialogOptions } from "electron";
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
-import { cp, mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
+import { existsSync, mkdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import {
   AppStateSnapshot,
@@ -58,7 +58,12 @@ type MenuAction =
   | "focus-left"
   | "focus-right"
   | "font-up"
-  | "font-down";
+  | "font-down"
+  | "reload-app";
+
+type ShutdownReason = "close" | "quit" | "reload" | "restart";
+type ShutdownResponse = { ok: boolean; error?: string };
+type WorkspacePersistenceState = "ready" | "importing" | "restart-required" | "shutting-down";
 
 app.setName("texteditor");
 
@@ -66,6 +71,22 @@ let currentLocale: Locale = "en";
 let startupRecoveryState: RecoveryState = { abnormalShutdown: false };
 let remoteInboxStatus: RemoteInboxStatus = { state: "stopped" };
 let remoteInboxSettings = defaultWorkspace.remoteInbox;
+let workspacePersistenceState: WorkspacePersistenceState = "ready";
+let persistenceMutationTail: Promise<void> = Promise.resolve();
+let remoteConfigurationTail: Promise<void> = Promise.resolve();
+let jsonWriteSequence = 0;
+let allowAppQuit = false;
+let cleanShutdownApproved = false;
+let activeLifecycleAction: { reason: ShutdownReason; promise: Promise<boolean> } | null = null;
+const windowsAllowedToClose = new WeakSet<BrowserWindow>();
+const shutdownReadyWebContents = new Set<number>();
+const loadedAppStateWebContents = new Set<number>();
+const pendingShutdownRequests = new Map<string, {
+  webContentsId: number;
+  resolve: (value: ShutdownResponse) => void;
+  timer: NodeJS.Timeout;
+}>();
+const jsonWriteQueues = new Map<string, Promise<void>>();
 const pendingRemoteAppends = new Map<string, { resolve: (value: { ok: boolean; error?: string }) => void; timer: NodeJS.Timeout }>();
 const pendingRemoteMutations = new Map<string, { resolve: (value: RemoteInboxMutationResult) => void; timer: NodeJS.Timeout }>();
 
@@ -102,6 +123,7 @@ const menuLabels: Record<
     focusRight: string;
     fontSizeUp: string;
     fontSizeDown: string;
+    reload: string;
     window: string;
   }
 > = {
@@ -136,6 +158,7 @@ const menuLabels: Record<
     focusRight: "Focus Right Editor",
     fontSizeUp: "Font Size Up",
     fontSizeDown: "Font Size Down",
+    reload: "Reload",
     window: "Window"
   },
   jp: {
@@ -169,6 +192,7 @@ const menuLabels: Record<
     focusRight: "右エディタへフォーカス",
     fontSizeUp: "フォントサイズを大きく",
     fontSizeDown: "フォントサイズを小さく",
+    reload: "再読み込み",
     window: "ウィンドウ"
   }
 };
@@ -176,6 +200,8 @@ const menuLabels: Record<
 if (process.env.TEXTEDITOR_USER_DATA) {
   app.setPath("userData", process.env.TEXTEDITOR_USER_DATA);
 }
+
+const hasSingleInstanceLock = app.requestSingleInstanceLock();
 
 function dataRoot(): string {
   return path.join(app.getPath("userData"), "data");
@@ -239,16 +265,79 @@ function backupPath(id: string, fileName: string): string {
 async function readJson<T>(filePath: string, fallback: T): Promise<T> {
   try {
     return JSON.parse(await readFile(filePath, "utf8")) as T;
-  } catch {
-    return fallback;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException)?.code === "ENOENT") {
+      return fallback;
+    }
+    const reason = error instanceof Error ? error.message : String(error);
+    throw new Error(`Failed to read JSON file "${filePath}": ${reason}`);
   }
 }
 
+function requireJsonObject(value: unknown, filePath: string): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`Invalid JSON object in "${filePath}".`);
+  }
+  return value as Record<string, unknown>;
+}
+
 async function writeJson(filePath: string, value: unknown): Promise<void> {
-  await mkdir(path.dirname(filePath), { recursive: true });
-  const tempPath = `${filePath}.tmp`;
-  await writeFile(tempPath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
-  await rename(tempPath, filePath);
+  const queueKey = path.resolve(filePath);
+  const previous = jsonWriteQueues.get(queueKey) ?? Promise.resolve();
+  const operation = previous.catch(() => undefined).then(async () => {
+    await mkdir(path.dirname(filePath), { recursive: true });
+    const tempPath = `${filePath}.tmp-${process.pid}-${Date.now()}-${++jsonWriteSequence}`;
+    try {
+      await writeFile(tempPath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+      await rename(tempPath, filePath);
+    } finally {
+      await rm(tempPath, { force: true }).catch(() => undefined);
+    }
+  });
+  jsonWriteQueues.set(queueKey, operation);
+  try {
+    await operation;
+  } finally {
+    if (jsonWriteQueues.get(queueKey) === operation) {
+      jsonWriteQueues.delete(queueKey);
+    }
+  }
+}
+
+function assertWorkspaceWritable(): void {
+  if (workspacePersistenceState !== "ready") {
+    if (workspacePersistenceState === "importing") {
+      throw new Error("Workspace import is in progress.");
+    }
+    if (workspacePersistenceState === "shutting-down") {
+      throw new Error("The app is shutting down. No new data was accepted.");
+    }
+    throw new Error("Workspace import completed. Restart the app before making more changes.");
+  }
+}
+
+function isWorkspaceImporting(): boolean {
+  return workspacePersistenceState === "importing";
+}
+
+function assertRendererStateLoaded(webContentsId: number): void {
+  if (!loadedAppStateWebContents.has(webContentsId)) {
+    throw new Error("The workspace is still loading. No data was saved.");
+  }
+}
+
+function enqueuePersistenceMutation<T>(operation: () => Promise<T>): Promise<T> {
+  assertWorkspaceWritable();
+  const result = persistenceMutationTail.then(operation, operation);
+  persistenceMutationTail = result.then(() => undefined, () => undefined);
+  return result;
+}
+
+async function waitForPersistenceIdle(): Promise<void> {
+  await persistenceMutationTail;
+  while (jsonWriteQueues.size > 0) {
+    await Promise.allSettled([...jsonWriteQueues.values()]);
+  }
 }
 
 async function ensureDataFiles(): Promise<void> {
@@ -290,10 +379,11 @@ async function markSessionStarted(): Promise<RecoveryState> {
 }
 
 function markSessionCleanSync(): void {
+  const tempPath = `${sessionPath()}.tmp-${process.pid}-${Date.now()}-${++jsonWriteSequence}`;
   try {
     mkdirSync(dataRoot(), { recursive: true });
     writeFileSync(
-      sessionPath(),
+      tempPath,
       `${JSON.stringify(
         {
           abnormalShutdown: false,
@@ -304,8 +394,15 @@ function markSessionCleanSync(): void {
       )}\n`,
       "utf8"
     );
+    renameSync(tempPath, sessionPath());
   } catch (error) {
     console.error("Failed to mark clean shutdown:", error);
+  } finally {
+    try {
+      rmSync(tempPath, { force: true });
+    } catch {
+      // Best effort cleanup during shutdown.
+    }
   }
 }
 
@@ -365,12 +462,13 @@ function normalizeWorkspace(input: Partial<WorkspaceState>): WorkspaceState {
 }
 
 function normalizeRemoteInboxTargetNames(value: unknown, fallback: string): string[] {
+  const primaryName = normalizeRemoteInboxTargetName(fallback);
   const names = Array.isArray(value) ? value : [fallback];
   const normalized = names
     .filter((name): name is string => typeof name === "string")
     .map((name) => name.trim())
     .filter((name) => Boolean(name) && name.length <= 120 && !/[\u0000-\u001F\u007F]/.test(name));
-  return [...new Set(normalized)].slice(0, 30) || [defaultWorkspace.remoteInbox.targetTabName];
+  return [...new Set([primaryName, ...normalized])].slice(0, 30);
 }
 
 function normalizeRemoteInboxTargetName(value: unknown): string {
@@ -380,11 +478,13 @@ function normalizeRemoteInboxTargetName(value: unknown): string {
 }
 
 async function loadWorkspace(): Promise<WorkspaceState> {
-  return normalizeWorkspace(await readJson<Partial<WorkspaceState>>(workspacePath(), defaultWorkspace));
+  const raw = requireJsonObject(await readJson<unknown>(workspacePath(), defaultWorkspace), workspacePath());
+  return normalizeWorkspace(raw as Partial<WorkspaceState>);
 }
 
 async function loadIndex(): Promise<TabsIndex> {
-  return normalizeTabsIndex(await readJson<Partial<TabsIndex>>(tabsIndexPath(), emptyTabsIndex));
+  const raw = requireJsonObject(await readJson<unknown>(tabsIndexPath(), emptyTabsIndex), tabsIndexPath());
+  return normalizeTabsIndex(raw as Partial<TabsIndex>);
 }
 
 function normalizeNewTabTemplate(value: unknown): NewTabTemplateId {
@@ -700,19 +800,24 @@ async function extractWorkspaceZip(zipPath: string): Promise<string> {
   }
 
   const backupPath = await backupCurrentWorkspaceBeforeImport();
-  const tempRoot = path.join(app.getPath("temp"), `texteditor-import-${Date.now()}`);
-  await rm(tempRoot, { recursive: true, force: true });
-  await mkdir(tempRoot, { recursive: true });
+  const importId = `${process.pid}-${Date.now()}`;
+  const stagingRoot = path.join(app.getPath("userData"), `.texteditor-import-stage-${importId}`);
+  const previousRoot = path.join(app.getPath("userData"), `.texteditor-import-previous-${importId}`);
+  await rm(stagingRoot, { recursive: true, force: true });
+  await rm(previousRoot, { recursive: true, force: true });
+  await mkdir(stagingRoot, { recursive: true });
+  let previousMoved = false;
+  let importCommitted = false;
 
   try {
     for (const entry of zip.getEntries()) {
       const safeName = safeArchiveEntryName(entry.entryName);
       if (entry.isDirectory) {
-        await mkdir(path.join(tempRoot, safeName), { recursive: true });
+        await mkdir(path.join(stagingRoot, safeName), { recursive: true });
         continue;
       }
-      const outputPath = path.join(tempRoot, safeName);
-      const relative = path.relative(tempRoot, outputPath);
+      const outputPath = path.join(stagingRoot, safeName);
+      const relative = path.relative(stagingRoot, outputPath);
       if (relative.startsWith("..") || path.isAbsolute(relative)) {
         throw new Error(`Invalid workspace zip path: ${entry.entryName}`);
       }
@@ -720,18 +825,172 @@ async function extractWorkspaceZip(zipPath: string): Promise<string> {
       await writeFile(outputPath, entry.getData());
     }
 
-    await rm(dataRoot(), { recursive: true, force: true });
-    await mkdir(dataRoot(), { recursive: true });
-    await cp(tempRoot, dataRoot(), { recursive: true });
-    currentLocale = (await loadWorkspace()).locale;
-    Menu.setApplicationMenu(buildApplicationMenu());
+    const stagedWorkspacePath = path.join(stagingRoot, "workspace.json");
+    const stagedIndexPath = path.join(stagingRoot, "tabs", "index.json");
+    normalizeWorkspace(requireJsonObject(await readJson<unknown>(stagedWorkspacePath, defaultWorkspace), stagedWorkspacePath) as Partial<WorkspaceState>);
+    normalizeTabsIndex(requireJsonObject(await readJson<unknown>(stagedIndexPath, emptyTabsIndex), stagedIndexPath) as Partial<TabsIndex>);
+
+    if (existsSync(dataRoot())) {
+      await rename(dataRoot(), previousRoot);
+      previousMoved = true;
+    }
+    try {
+      await rename(stagingRoot, dataRoot());
+      importCommitted = true;
+    } catch (error) {
+      if (previousMoved && !existsSync(dataRoot())) {
+        await rename(previousRoot, dataRoot());
+        previousMoved = false;
+      }
+      throw error;
+    }
+
     return backupPath;
   } finally {
-    await rm(tempRoot, { recursive: true, force: true });
+    await rm(stagingRoot, { recursive: true, force: true }).catch(() => undefined);
+    if (importCommitted && previousMoved) {
+      await rm(previousRoot, { recursive: true, force: true }).catch((error) => {
+        console.error("Failed to remove the pre-import workspace staging directory:", error);
+      });
+    }
+  }
+}
+
+async function requestRendererShutdown(window: BrowserWindow, reason: ShutdownReason): Promise<ShutdownResponse> {
+  if (window.isDestroyed() || window.webContents.isDestroyed()) {
+    return { ok: false, error: "The editor window is unavailable." };
+  }
+  const webContentsId = window.webContents.id;
+  if (!shutdownReadyWebContents.has(webContentsId)) {
+    return { ok: false, error: "The editor has not finished initializing its save handler." };
+  }
+
+  const id = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  return new Promise<ShutdownResponse>((resolve) => {
+    const timer = setTimeout(() => {
+      pendingShutdownRequests.delete(id);
+      resolve({ ok: false, error: "Timed out while waiting for the editor to finish saving." });
+    }, 15_000);
+    pendingShutdownRequests.set(id, { webContentsId, resolve, timer });
+    try {
+      window.webContents.send("app:shutdown-request", { id, reason });
+    } catch (error) {
+      clearTimeout(timer);
+      pendingShutdownRequests.delete(id);
+      resolve({ ok: false, error: error instanceof Error ? error.message : "Unable to contact the editor." });
+    }
+  });
+}
+
+async function confirmUnsafeLifecycleAction(window: BrowserWindow, reason: ShutdownReason, error: string): Promise<boolean> {
+  const japanese = currentLocale === "jp";
+  const forceLabel = japanese
+    ? reason === "reload" ? "保存せず再読み込み" : reason === "restart" ? "保存せず再起動" : "保存せず終了"
+    : reason === "reload" ? "Reload Without Saving" : reason === "restart" ? "Restart Without Saving" : "Quit Without Saving";
+  const options: Electron.MessageBoxOptions = {
+    type: "warning",
+    buttons: [japanese ? "編集に戻る" : "Keep Editing", forceLabel],
+    defaultId: 0,
+    cancelId: 0,
+    noLink: true,
+    message: japanese ? "保存処理を完了できませんでした。" : "The save operation could not be completed.",
+    detail: japanese
+      ? `${error}\n\n安全のため操作を中止しました。保存せずに続行する場合のみ、2番目のボタンを選択してください。`
+      : `${error}\n\nThe action was canceled to protect your data. Choose the second button only if you want to continue without saving.`
+  };
+  const result = window.isDestroyed()
+    ? await dialog.showMessageBox(options)
+    : await dialog.showMessageBox(window, options);
+  return result.response === 1;
+}
+
+async function performLifecycleAction(window: BrowserWindow, reason: ShutdownReason): Promise<boolean> {
+  const saveResult = await requestRendererShutdown(window, reason);
+  if (isWorkspaceImporting()) {
+    return false;
+  }
+  let force = false;
+  if (!saveResult.ok) {
+    force = await confirmUnsafeLifecycleAction(window, reason, saveResult.error ?? "Unknown save error");
+    if (!force || isWorkspaceImporting()) {
+      return false;
+    }
+  }
+
+  if (reason === "quit" || reason === "restart") {
+    BrowserWindow.getAllWindows().forEach((openWindow) => {
+      loadedAppStateWebContents.delete(openWindow.webContents.id);
+    });
+  } else if (!window.isDestroyed()) {
+    loadedAppStateWebContents.delete(window.webContents.id);
+  }
+
+  const shouldStopRemoteInbox = reason !== "reload" && (reason !== "close" || process.platform !== "darwin");
+  if (saveResult.ok) {
+    if (shouldStopRemoteInbox) {
+      workspacePersistenceState = "shutting-down";
+    }
+    await waitForPersistenceIdle();
+  }
+
+  if (reason === "reload") {
+    if (!window.isDestroyed() && !window.webContents.isDestroyed()) {
+      shutdownReadyWebContents.delete(window.webContents.id);
+      setImmediate(() => {
+        if (!window.isDestroyed() && !window.webContents.isDestroyed()) {
+          window.webContents.reload();
+        }
+      });
+      return true;
+    }
+    return false;
+  }
+
+  if (saveResult.ok && shouldStopRemoteInbox) {
+    await stopRemoteInboxAfterConfiguration();
+  }
+
+  cleanShutdownApproved = saveResult.ok;
+  if (reason === "close") {
+    windowsAllowedToClose.add(window);
+    setImmediate(() => {
+      if (!window.isDestroyed()) window.close();
+    });
+    return true;
+  }
+
+  allowAppQuit = true;
+  BrowserWindow.getAllWindows().forEach((openWindow) => {
+    loadedAppStateWebContents.delete(openWindow.webContents.id);
+    windowsAllowedToClose.add(openWindow);
+  });
+  setImmediate(() => {
+    if (reason === "restart") app.relaunch();
+    app.quit();
+  });
+  return true;
+}
+
+async function requestLifecycleAction(window: BrowserWindow, requestedReason: ShutdownReason): Promise<boolean> {
+  const reason = requestedReason === "reload" && workspacePersistenceState === "restart-required"
+    ? "restart"
+    : requestedReason;
+  if (activeLifecycleAction) {
+    return activeLifecycleAction.reason === reason ? activeLifecycleAction.promise : false;
+  }
+  const promise = performLifecycleAction(window, reason);
+  activeLifecycleAction = { reason, promise };
+  try {
+    return await promise;
+  } finally {
+    if (activeLifecycleAction?.promise === promise) {
+      activeLifecycleAction = null;
+    }
   }
 }
 
 function createWindow(): void {
+  cleanShutdownApproved = false;
   const mainWindow = new BrowserWindow({
     width: 1220,
     height: 820,
@@ -745,7 +1004,27 @@ function createWindow(): void {
       nodeIntegration: false
     }
   });
+  const webContentsId = mainWindow.webContents.id;
 
+  mainWindow.on("close", (event) => {
+    if (windowsAllowedToClose.has(mainWindow)) {
+      return;
+    }
+    event.preventDefault();
+    void requestLifecycleAction(mainWindow, "close").catch((error) => {
+      console.error("Failed to complete the close handshake:", error);
+    });
+  });
+  mainWindow.webContents.on("destroyed", () => {
+    shutdownReadyWebContents.delete(webContentsId);
+    loadedAppStateWebContents.delete(webContentsId);
+    for (const [id, pending] of pendingShutdownRequests) {
+      if (pending.webContentsId !== webContentsId) continue;
+      clearTimeout(pending.timer);
+      pendingShutdownRequests.delete(id);
+      pending.resolve({ ok: false, error: "The editor process stopped before saving completed." });
+    }
+  });
   void mainWindow.loadFile(path.join(__dirname, "../renderer/index.html"));
 }
 
@@ -809,8 +1088,8 @@ function buildApplicationMenu(): Menu {
         { label: label.fontSizeUp, accelerator: "CmdOrCtrl+Plus", click: () => sendMenuAction("font-up") },
         { label: label.fontSizeDown, accelerator: "CmdOrCtrl+-", click: () => sendMenuAction("font-down") },
         { type: "separator" },
-        { role: "reload" },
-        { role: "toggleDevTools" }
+        { label: label.reload, accelerator: "CmdOrCtrl+R", click: () => sendMenuAction("reload-app") },
+        ...(!app.isPackaged ? [{ role: "toggleDevTools" as const }] : [])
       ]
     },
     {
@@ -840,7 +1119,9 @@ const remoteInboxServer = new RemoteInboxServer({
   },
   read: async (targetTabName) => {
     const index = await loadIndex();
-    const meta = index.tabs.find((tab) => tab.title === targetTabName);
+    const matches = index.tabs.filter((tab) => tab.title === targetTabName);
+    if (matches.length > 1) return { error: "Remote Inbox target is ambiguous" };
+    const meta = matches[0];
     if (!meta) return { content: "" };
     try {
       const tab = normalizeTabDocument(await readJson<TabDocument>(tabPath(meta.id), { id: meta.id, title: meta.title, content: "", updatedAt: meta.updatedAt }));
@@ -851,7 +1132,9 @@ const remoteInboxServer = new RemoteInboxServer({
   },
   getRemoteInbox: async (targetTabName) => {
     const index = await loadIndex();
-    const meta = index.tabs.find((tab) => tab.title === targetTabName);
+    const matches = index.tabs.filter((tab) => tab.title === targetTabName);
+    if (matches.length > 1) throw new Error("Remote Inbox target is ambiguous");
+    const meta = matches[0];
     if (!meta) return { target: targetTabName, content: "", revision: 0, updatedAt: new Date(0).toISOString() };
     const tab = normalizeTabDocument(await readJson<TabDocument>(tabPath(meta.id), { id: meta.id, title: meta.title, content: "", updatedAt: meta.updatedAt, revision: 0 }));
     return { id: tab.id, target: targetTabName, content: getMainChildTab(tab).content, revision: tab.revision ?? 0, updatedAt: tab.updatedAt };
@@ -882,12 +1165,43 @@ const remoteInboxServer = new RemoteInboxServer({
   }
 });
 
-ipcMain.handle("app:load", async (): Promise<AppStateSnapshot> => {
+function enqueueRemoteInboxConfiguration(): Promise<RemoteInboxStatus> {
+  const operation = remoteConfigurationTail.then(
+    () => remoteInboxServer.configure(),
+    () => remoteInboxServer.configure()
+  );
+  remoteConfigurationTail = operation.then(() => undefined, () => undefined);
+  return operation;
+}
+
+async function stopRemoteInboxAfterConfiguration(): Promise<void> {
+  await remoteConfigurationTail;
+  await remoteInboxServer.stop();
+}
+
+ipcMain.on("app:shutdown-handler-ready", (event) => {
+  shutdownReadyWebContents.add(event.sender.id);
+});
+
+ipcMain.on("app:shutdown-response", (event, payload: { id?: string; ok?: boolean; error?: string }) => {
+  if (typeof payload?.id !== "string") return;
+  const pending = pendingShutdownRequests.get(payload.id);
+  if (!pending || pending.webContentsId !== event.sender.id) return;
+  clearTimeout(pending.timer);
+  pendingShutdownRequests.delete(payload.id);
+  pending.resolve({
+    ok: payload.ok === true,
+    error: typeof payload.error === "string" ? payload.error : undefined
+  });
+});
+
+ipcMain.handle("app:load", async (event): Promise<AppStateSnapshot> => {
   await ensureDataFiles();
   const workspace = await loadWorkspace();
   remoteInboxSettings = workspace.remoteInbox;
   const tabIndex = await loadIndex();
   await createStartupBackups(workspace, tabIndex);
+  loadedAppStateWebContents.add(event.sender.id);
   return {
     workspace,
     tabIndex,
@@ -896,30 +1210,54 @@ ipcMain.handle("app:load", async (): Promise<AppStateSnapshot> => {
   };
 });
 
-ipcMain.handle("app:recovery:ack", async (_event, restore: boolean): Promise<void> => {
-  startupRecoveryState = { ...startupRecoveryState, abnormalShutdown: false };
-  await writeJson(sessionPath(), {
-    abnormalShutdown: true,
-    startedAt: new Date().toISOString(),
-    lastShutdownAt: startupRecoveryState.lastShutdownAt,
-    recoveryChoice: restore ? "restore" : "skip"
+ipcMain.handle("app:recovery:ack", async (event, restore: boolean): Promise<void> => {
+  assertRendererStateLoaded(event.sender.id);
+  return enqueuePersistenceMutation(async () => {
+    startupRecoveryState = { ...startupRecoveryState, abnormalShutdown: false };
+    await writeJson(sessionPath(), {
+      abnormalShutdown: true,
+      startedAt: new Date().toISOString(),
+      lastShutdownAt: startupRecoveryState.lastShutdownAt,
+      recoveryChoice: restore ? "restore" : "skip"
+    });
   });
 });
 
-ipcMain.handle("app:quit", async (): Promise<void> => {
-  app.quit();
+ipcMain.handle("app:quit", async (event): Promise<boolean> => {
+  const window = BrowserWindow.fromWebContents(event.sender);
+  return window ? requestLifecycleAction(window, "quit") : false;
 });
 
-ipcMain.handle("workspace:save", async (_event, workspace: WorkspaceState): Promise<WorkspaceState> => {
-  const normalized = normalizeWorkspace(workspace);
-  await writeJson(workspacePath(), normalized);
-  remoteInboxSettings = normalized.remoteInbox;
-  if (currentLocale !== normalized.locale) {
-    currentLocale = normalized.locale;
-    Menu.setApplicationMenu(buildApplicationMenu());
-  }
-  await remoteInboxServer.configure();
-  return normalized;
+ipcMain.handle("app:request-reload", async (event): Promise<boolean> => {
+  const window = BrowserWindow.fromWebContents(event.sender);
+  return window ? requestLifecycleAction(window, "reload") : false;
+});
+
+ipcMain.handle("app:request-restart", async (event): Promise<boolean> => {
+  const window = BrowserWindow.fromWebContents(event.sender);
+  return window ? requestLifecycleAction(window, "restart") : false;
+});
+
+ipcMain.handle("workspace:save", async (event, workspace: WorkspaceState): Promise<WorkspaceState> => {
+  assertRendererStateLoaded(event.sender.id);
+  const result = await enqueuePersistenceMutation(async () => {
+    const normalized = normalizeWorkspace(workspace);
+    await writeJson(workspacePath(), normalized);
+    const remoteSettingsChanged = JSON.stringify(remoteInboxSettings) !== JSON.stringify(normalized.remoteInbox);
+    remoteInboxSettings = normalized.remoteInbox;
+    if (currentLocale !== normalized.locale) {
+      currentLocale = normalized.locale;
+      Menu.setApplicationMenu(buildApplicationMenu());
+    }
+    return {
+      normalized,
+      configured: remoteSettingsChanged
+        ? enqueueRemoteInboxConfiguration()
+        : Promise.resolve(remoteInboxStatus)
+    };
+  });
+  await result.configured;
+  return result.normalized;
 });
 
 ipcMain.handle("remote-inbox:status", async (): Promise<RemoteInboxStatus> => remoteInboxStatus);
@@ -939,14 +1277,20 @@ ipcMain.on("remote-inbox:mutate-result", (_event, payload: RemoteInboxMutationRe
   pendingRemoteMutations.delete(payload.id);
   pending.resolve(payload);
 });
-ipcMain.handle("remote-inbox:pc-clear-audit", async (_event, payload: { tabId: string; targetTabName: string; revision: number; beforeCharacters: number }): Promise<void> => {
-  await remoteInboxServer.auditPcClear(payload.tabId, payload.targetTabName, payload.revision, payload.beforeCharacters);
+ipcMain.handle("remote-inbox:pc-clear-audit", async (event, payload: { tabId: string; targetTabName: string; revision: number; beforeCharacters: number }): Promise<void> => {
+  assertRendererStateLoaded(event.sender.id);
+  return enqueuePersistenceMutation(async () => {
+    await remoteInboxServer.auditPcClear(payload.tabId, payload.targetTabName, payload.revision, payload.beforeCharacters);
+  });
 });
 
-ipcMain.handle("tabs:index:save", async (_event, index: TabsIndex): Promise<TabsIndex> => {
-  const normalized = normalizeTabsIndex(index);
-  await writeJson(tabsIndexPath(), normalized);
-  return normalized;
+ipcMain.handle("tabs:index:save", async (event, index: TabsIndex): Promise<TabsIndex> => {
+  assertRendererStateLoaded(event.sender.id);
+  return enqueuePersistenceMutation(async () => {
+    const normalized = normalizeTabsIndex(index);
+    await writeJson(tabsIndexPath(), normalized);
+    return normalized;
+  });
 });
 
 ipcMain.handle("tab:load", async (_event, id: string): Promise<TabDocument> => {
@@ -961,75 +1305,82 @@ ipcMain.handle("tab:load", async (_event, id: string): Promise<TabDocument> => {
   }));
 });
 
-ipcMain.handle("tab:save", async (_event, tab: TabDocument): Promise<TabDocument> => {
-  assertTabId(tab.id);
-  const updatedAt = new Date().toISOString();
-  const normalized: TabDocument = normalizeTabDocument({
-    ...tab,
-    title: tab.title.trim() || "Untitled",
-    updatedAt,
-    childTabs: getChildTabs(tab).map((child) => ({
-      ...child,
-      updatedAt: child.updatedAt || updatedAt
-    }))
+ipcMain.handle("tab:save", async (event, tab: TabDocument): Promise<TabDocument> => {
+  assertRendererStateLoaded(event.sender.id);
+  return enqueuePersistenceMutation(async () => {
+    assertTabId(tab.id);
+    const updatedAt = new Date().toISOString();
+    const normalized: TabDocument = normalizeTabDocument({
+      ...tab,
+      title: tab.title.trim() || "Untitled",
+      updatedAt,
+      childTabs: getChildTabs(tab).map((child) => ({
+        ...child,
+        updatedAt: child.updatedAt || updatedAt
+      }))
+    });
+
+    await writeJson(tabPath(tab.id), normalized);
+
+    const index = await loadIndex();
+    const meta = {
+      id: normalized.id,
+      title: normalized.title,
+      updatedAt,
+      wordCount: countWords(getMainChildTab(normalized).content),
+      pinned: index.tabs.find((entry) => entry.id === tab.id)?.pinned ?? false
+    };
+    const tabs = index.tabs.some((entry) => entry.id === tab.id)
+      ? index.tabs.map((entry) => (entry.id === tab.id ? meta : entry))
+      : [...index.tabs, meta];
+    const nextIndex = normalizeTabsIndex({
+      ...index,
+      tabs,
+      ungroupedTabIds: index.tabs.some((entry) => entry.id === tab.id)
+        ? index.ungroupedTabIds
+        : [...(index.ungroupedTabIds ?? []), normalized.id]
+    });
+    await writeJson(tabsIndexPath(), nextIndex);
+
+    return normalized;
   });
-
-  await writeJson(tabPath(tab.id), normalized);
-
-  const index = await loadIndex();
-  const meta = {
-    id: normalized.id,
-    title: normalized.title,
-    updatedAt,
-    wordCount: countWords(getMainChildTab(normalized).content),
-    pinned: index.tabs.find((entry) => entry.id === tab.id)?.pinned ?? false
-  };
-  const tabs = index.tabs.some((entry) => entry.id === tab.id)
-    ? index.tabs.map((entry) => (entry.id === tab.id ? meta : entry))
-    : [...index.tabs, meta];
-  const nextIndex = normalizeTabsIndex({
-    ...index,
-    tabs,
-    ungroupedTabIds: index.tabs.some((entry) => entry.id === tab.id)
-      ? index.ungroupedTabIds
-      : [...(index.ungroupedTabIds ?? []), normalized.id]
-  });
-  await writeJson(tabsIndexPath(), nextIndex);
-
-  return normalized;
 });
 
-ipcMain.handle("tab:delete", async (_event, id: string): Promise<TabsIndex> => {
-  assertTabId(id);
-  const index = await loadIndex();
-  const meta = index.tabs.find((tab) => tab.id === id);
-  const tab = normalizeTabDocument(await readJson<TabDocument>(tabPath(id), {
-    id,
-    title: meta?.title ?? "Untitled",
-    content: "",
-    updatedAt: meta?.updatedAt ?? new Date().toISOString()
-  }));
-  try {
-    await createBackup(tab, { force: true });
-  } catch (error) {
-    console.error("Failed to create final backup before delete:", error);
-  }
-  await rm(tabPath(id), { force: true });
-  const nextIndex = normalizeTabsIndex({
-    ...index,
-    groups: index.groups?.map((group) => ({
-      ...group,
-      tabIds: group.tabIds.filter((tabId) => tabId !== id)
-    })),
-    ungroupedTabIds: index.ungroupedTabIds?.filter((tabId) => tabId !== id),
-    tabs: index.tabs.filter((tab) => tab.id !== id)
+ipcMain.handle("tab:delete", async (event, id: string): Promise<TabsIndex> => {
+  assertRendererStateLoaded(event.sender.id);
+  return enqueuePersistenceMutation(async () => {
+    assertTabId(id);
+    const index = await loadIndex();
+    const meta = index.tabs.find((tab) => tab.id === id);
+    const tab = normalizeTabDocument(await readJson<TabDocument>(tabPath(id), {
+      id,
+      title: meta?.title ?? "Untitled",
+      content: "",
+      updatedAt: meta?.updatedAt ?? new Date().toISOString()
+    }));
+    try {
+      await createBackup(tab, { force: true });
+    } catch (error) {
+      console.error("Failed to create final backup before delete:", error);
+    }
+    await rm(tabPath(id), { force: true });
+    const nextIndex = normalizeTabsIndex({
+      ...index,
+      groups: index.groups?.map((group) => ({
+        ...group,
+        tabIds: group.tabIds.filter((tabId) => tabId !== id)
+      })),
+      ungroupedTabIds: index.ungroupedTabIds?.filter((tabId) => tabId !== id),
+      tabs: index.tabs.filter((tab) => tab.id !== id)
+    });
+    await writeJson(tabsIndexPath(), nextIndex);
+    return nextIndex;
   });
-  await writeJson(tabsIndexPath(), nextIndex);
-  return nextIndex;
 });
 
-ipcMain.handle("tab:backup:create", async (_event, tab: TabDocument): Promise<BackupMeta | null> => {
-  return createBackup(tab);
+ipcMain.handle("tab:backup:create", async (event, tab: TabDocument): Promise<BackupMeta | null> => {
+  assertRendererStateLoaded(event.sender.id);
+  return enqueuePersistenceMutation(() => createBackup(tab));
 });
 
 ipcMain.handle("tab:backup:list", async (_event, id: string): Promise<BackupMeta[]> => {
@@ -1224,7 +1575,8 @@ ipcMain.handle("workspace:export", async (): Promise<WorkspaceTransferResult> =>
   return { canceled: false, filePath: result.filePath };
 });
 
-ipcMain.handle("workspace:import", async (): Promise<WorkspaceTransferResult> => {
+ipcMain.handle("workspace:import", async (event): Promise<WorkspaceTransferResult> => {
+  assertRendererStateLoaded(event.sender.id);
   const selectedPath = process.env.TEXTEDITOR_WORKSPACE_IMPORT_PATH;
   let filePath = selectedPath;
   if (!filePath) {
@@ -1243,32 +1595,121 @@ ipcMain.handle("workspace:import", async (): Promise<WorkspaceTransferResult> =>
     filePath = result.filePaths[0];
   }
 
-  const backupPath = await extractWorkspaceZip(filePath);
-  return { canceled: false, filePath, backupPath };
+  assertRendererStateLoaded(event.sender.id);
+  assertWorkspaceWritable();
+  workspacePersistenceState = "importing";
+  let importCommitted = false;
+  let backupPath: string | undefined;
+  try {
+    await waitForPersistenceIdle();
+    await stopRemoteInboxAfterConfiguration();
+    backupPath = await extractWorkspaceZip(filePath);
+    importCommitted = true;
+    const importedWorkspace = await loadWorkspace();
+    currentLocale = importedWorkspace.locale;
+    remoteInboxSettings = importedWorkspace.remoteInbox;
+    workspacePersistenceState = "restart-required";
+    Menu.setApplicationMenu(buildApplicationMenu());
+    return { canceled: false, filePath, backupPath, restartRequired: true };
+  } catch (error) {
+    const existingWorkspaceIntact = existsSync(workspacePath()) && existsSync(tabsIndexPath());
+    let canResumeCurrentWorkspace = !importCommitted && existingWorkspaceIntact;
+    workspacePersistenceState = canResumeCurrentWorkspace ? "ready" : "restart-required";
+    if (canResumeCurrentWorkspace) {
+      try {
+        const currentWorkspace = await loadWorkspace();
+        currentLocale = currentWorkspace.locale;
+        remoteInboxSettings = currentWorkspace.remoteInbox;
+        Menu.setApplicationMenu(buildApplicationMenu());
+        await enqueueRemoteInboxConfiguration();
+      } catch (restoreError) {
+        canResumeCurrentWorkspace = false;
+        workspacePersistenceState = "restart-required";
+        console.error("Failed to restore Remote Inbox after a canceled workspace import:", restoreError);
+      }
+    }
+    if (!canResumeCurrentWorkspace) {
+      const reason = error instanceof Error ? error.message : String(error);
+      return {
+        canceled: false,
+        filePath,
+        backupPath,
+        restartRequired: true,
+        error: `${reason} Restart the app before continuing.`
+      };
+    }
+    throw error;
+  }
 });
 
 ipcMain.handle("clipboard:writeText", async (_event, text: string): Promise<void> => {
   clipboard.writeText(text);
 });
 
-app.whenReady().then(async () => {
-  await ensureDataFiles();
-  startupRecoveryState = await markSessionStarted();
-  currentLocale = (await loadWorkspace()).locale;
-  remoteInboxSettings = (await loadWorkspace()).remoteInbox;
-  await remoteInboxServer.configure();
-  Menu.setApplicationMenu(buildApplicationMenu());
-  createWindow();
-  app.on("activate", () => {
-    if (BrowserWindow.getAllWindows().length === 0) {
+if (!hasSingleInstanceLock) {
+  app.quit();
+} else {
+  app.on("second-instance", () => {
+    const window = BrowserWindow.getAllWindows()[0];
+    if (window) {
+      if (window.isMinimized()) window.restore();
+      window.show();
+      window.focus();
+    } else if (app.isReady()) {
       createWindow();
     }
   });
+
+  app.whenReady().then(async () => {
+    try {
+      await ensureDataFiles();
+      startupRecoveryState = await markSessionStarted();
+      const initialWorkspace = await loadWorkspace();
+      currentLocale = initialWorkspace.locale;
+      remoteInboxSettings = initialWorkspace.remoteInbox;
+      await enqueueRemoteInboxConfiguration();
+      Menu.setApplicationMenu(buildApplicationMenu());
+      createWindow();
+      app.on("activate", () => {
+        if (BrowserWindow.getAllWindows().length === 0) {
+          createWindow();
+        }
+      });
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      dialog.showErrorBox(
+        currentLocale === "jp" ? "Workspaceを開けません" : "Unable to Open Workspace",
+        currentLocale === "jp"
+          ? `JSONファイルを読み込めませんでした。データ保護のため起動を中止します。\n\n${reason}`
+          : `A JSON file could not be read. Startup was stopped to protect your data.\n\n${reason}`
+      );
+      allowAppQuit = true;
+      app.quit();
+    }
+  });
+}
+
+app.on("before-quit", (event) => {
+  if (allowAppQuit || !hasSingleInstanceLock) {
+    return;
+  }
+  event.preventDefault();
+  const window = BrowserWindow.getFocusedWindow() ?? BrowserWindow.getAllWindows()[0];
+  if (window) {
+    void requestLifecycleAction(window, "quit").catch((error) => {
+      console.error("Failed to complete the quit handshake:", error);
+    });
+    return;
+  }
+  allowAppQuit = true;
+  app.quit();
 });
 
 app.on("will-quit", () => {
-  void remoteInboxServer.stop();
-  markSessionCleanSync();
+  void stopRemoteInboxAfterConfiguration();
+  if (cleanShutdownApproved) {
+    markSessionCleanSync();
+  }
 });
 
 app.on("window-all-closed", () => {
