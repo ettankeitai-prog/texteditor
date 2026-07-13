@@ -901,7 +901,7 @@ body.is-split-resizing {
   font-size: 13px;
 }
 
-.settings-field input,
+.settings-field input:not([type="checkbox"]):not([type="radio"]),
 .settings-field textarea {
   width: 100%;
   box-sizing: border-box;
