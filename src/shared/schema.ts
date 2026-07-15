@@ -1,3 +1,5 @@
+import type { AiRewriteSettings } from "./aiRewrite.js";
+
 export type ThemeMode = "dark" | "light";
 export type Locale = "en" | "jp";
 export type PaneId = "left" | "right";
@@ -48,6 +50,7 @@ export interface WorkspaceState {
   templates: WorkspaceTemplates;
   layout: WorkspaceLayout;
   remoteInbox: RemoteInboxSettings;
+  aiRewrite: AiRewriteSettings;
 }
 
 export interface TabMeta {
@@ -183,6 +186,10 @@ export const defaultWorkspace: WorkspaceState = {
     accessTeamDomain: "",
     accessAudience: "",
     allowedEmail: ""
+  },
+  aiRewrite: {
+    enabled: true,
+    defaultPreset: "formalize"
   },
   layout: {
     splitMode: "single",

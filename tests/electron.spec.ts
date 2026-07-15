@@ -146,7 +146,7 @@ async function createGroupFromSidebarBlank(page: Page) {
   await page.getByRole("button", { name: "New Group" }).click();
 }
 
-test.describe("Text Editor Electron v2.0.0", () => {
+test.describe("Text Editor Electron v2.1.0", () => {
   test.describe("undo and redo history", () => {
     test("undoes and redoes basic input", async ({}, testInfo) => {
       const { app, page } = await launchTextEditor(testInfo);
@@ -1069,9 +1069,86 @@ test.describe("Text Editor Electron v2.0.0", () => {
         await expect(relaunched.page.locator('section[data-pane-id="right"]')).toBeVisible();
         await expect(relaunched.page.locator("#left-pane-title")).toHaveValue("Left Story");
         await expect(relaunched.page.locator("#right-pane-title")).toHaveValue("Right Notes");
+        await relaunched.app.evaluate(({ BrowserWindow }) => {
+          BrowserWindow.getAllWindows()[0]?.webContents.send("menu:action", "close-split");
+        });
+        await expect(relaunched.page.locator('section[data-pane-id="right"]')).toBeHidden();
+        await expect(relaunched.page.locator("#left-editor-host .cm-content")).toContainText("left text");
+        await expect.poll(() => relaunched.page.evaluate(() => {
+          const line = document.querySelector<HTMLElement>("#left-editor-host .cm-line");
+          const content = document.querySelector<HTMLElement>("#left-editor-host .cm-content");
+          if (!line || !content) return false;
+          const lineRect = line.getBoundingClientRect();
+          const contentRect = content.getBoundingClientRect();
+          return lineRect.width > 0 && lineRect.height > 0 && contentRect.width > 0 && contentRect.height > 0;
+        })).toBe(true);
       } finally {
         await closeApp(relaunched.app);
       }
+    } finally {
+      await closeApp(app);
+    }
+  });
+
+  test("keeps a long editor viewport rendered after closing split", async ({}, testInfo) => {
+    const { app, page } = await launchTextEditor(testInfo);
+    try {
+      const content = Array.from(
+        { length: 80 },
+        (_, index) => `${index + 1}: ${"長い折り返し文です。".repeat(8)}`
+      ).join("\n");
+      await replaceEditorText(page, content);
+      await pressShortcut(page, "Control+\\");
+      await expect(page.locator('section[data-pane-id="right"]')).toBeVisible();
+      await pressShortcut(page, "Control+1");
+      await page.locator("#left-editor-host .cm-scroller").evaluate((scroller) => {
+        scroller.scrollTop = scroller.scrollHeight;
+        scroller.dispatchEvent(new Event("scroll", { bubbles: true }));
+      });
+
+      await app.evaluate(({ BrowserWindow }) => {
+        BrowserWindow.getAllWindows()[0]?.webContents.send("menu:action", "close-split");
+      });
+      await expect(page.locator('section[data-pane-id="right"]')).toBeHidden();
+
+      const readGeometry = () => page.evaluate(() => {
+        const selectors = [
+          "#editor-area",
+          "#editor-split",
+          'section[data-pane-id="left"]',
+          "#left-editor-host",
+          "#left-editor-host .cm-editor",
+          "#left-editor-host .cm-scroller",
+          "#left-editor-host .cm-content"
+        ];
+        const entries = selectors.map((selector) => {
+          const element = document.querySelector<HTMLElement>(selector);
+          if (!element) return [selector, null] as const;
+          const rect = element.getBoundingClientRect();
+          const style = getComputedStyle(element);
+          return [selector, {
+            width: rect.width,
+            height: rect.height,
+            display: style.display,
+            visibility: style.visibility,
+            scrollHeight: element.scrollHeight,
+            clientHeight: element.clientHeight
+          }] as const;
+        });
+        const lineCount = document.querySelectorAll("#left-editor-host .cm-line").length;
+        return { entries: Object.fromEntries(entries), lineCount };
+      });
+      await expect.poll(async () => (await readGeometry()).lineCount).toBeGreaterThan(0);
+      const geometry = await readGeometry();
+      for (const [selector, value] of Object.entries(geometry.entries)) {
+        expect(value, `${selector} should exist`).not.toBeNull();
+        expect(value!.width, `${selector} width`).toBeGreaterThan(0);
+        expect(value!.height, `${selector} height`).toBeGreaterThan(0);
+        expect(value!.display, `${selector} display`).not.toBe("none");
+        expect(value!.visibility, `${selector} visibility`).not.toBe("hidden");
+      }
+      expect(geometry.lineCount).toBeGreaterThan(0);
+      await expect(page.locator("#left-editor-host .cm-content")).toContainText("80:");
     } finally {
       await closeApp(app);
     }

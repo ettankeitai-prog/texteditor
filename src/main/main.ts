@@ -49,6 +49,10 @@ import type {
   NovelViewerTocState,
   NovelViewerUiLayoutUpdate
 } from "../shared/novelViewer.js";
+import type { AiRewriteConnectionStatus, AiRewriteRequest, AiRewriteResponse } from "../shared/aiRewrite.js";
+import { AI_REWRITE_MAX_CHARACTERS, isAiRewritePresetId } from "../shared/aiRewrite.js";
+import { AiRewriteService, createAiRewriteLaunchOptions } from "./aiRewrite/aiRewriteService.js";
+import { AiRewriteDiagnostics, sanitizeAiRewriteDiagnosticDetails } from "./aiRewrite/aiRewriteDiagnostics.js";
 
 type MenuAction =
   | "new-tab"
@@ -69,6 +73,7 @@ type MenuAction =
   | "replace"
   | "find-next"
   | "find-previous"
+  | "ai-rewrite"
   | "toggle-theme"
   | "toggle-locale"
   | "open-settings"
@@ -107,6 +112,8 @@ let allowAppQuit = false;
 let cleanShutdownApproved = false;
 let activeLifecycleAction: { reason: ShutdownReason; promise: Promise<boolean> } | null = null;
 let novelViewerController: NovelViewerController | null = null;
+let aiRewriteService: AiRewriteService | null = null;
+let aiRewriteDiagnostics: AiRewriteDiagnostics | null = null;
 const windowsAllowedToClose = new WeakSet<BrowserWindow>();
 const shutdownReadyWebContents = new Set<number>();
 const loadedAppStateWebContents = new Set<number>();
@@ -142,6 +149,7 @@ const menuLabels: Record<
     replace: string;
     findNext: string;
     findPrevious: string;
+    aiRewrite: string;
     view: string;
     toggleTheme: string;
     toggleLocale: string;
@@ -182,6 +190,7 @@ const menuLabels: Record<
     replace: "Replace",
     findNext: "Find Next",
     findPrevious: "Find Previous",
+    aiRewrite: "Rewrite with AI...",
     view: "View",
     toggleTheme: "Toggle Theme",
     toggleLocale: "Switch to Japanese",
@@ -221,6 +230,7 @@ const menuLabels: Record<
     replace: "置換",
     findNext: "次を検索",
     findPrevious: "前を検索",
+    aiRewrite: "AIで文章を整える...",
     view: "表示",
     toggleTheme: "テーマ切替",
     toggleLocale: "英語に切替",
@@ -277,6 +287,31 @@ function novelViewerTocCachePath(): string {
 
 function novelViewerDebugLogPath(): string {
   return path.join(app.getPath("userData"), "reader", "novel-viewer-debug.log");
+}
+
+function aiRewriteWorkspacePath(): string {
+  return path.join(app.getPath("userData"), "ai-rewrite-workspace");
+}
+
+function aiRewriteDebugLogPath(): string {
+  return path.join(app.getPath("userData"), "ai-rewrite", "ai-rewrite-debug.log");
+}
+
+function getAiRewriteService(): AiRewriteService {
+  if (!aiRewriteService) {
+    const workspaceDirectory = aiRewriteWorkspacePath();
+    aiRewriteDiagnostics ??= new AiRewriteDiagnostics(aiRewriteDebugLogPath());
+    aiRewriteService = new AiRewriteService(
+      workspaceDirectory,
+      createAiRewriteLaunchOptions(workspaceDirectory, app.isPackaged),
+      (event, details) => {
+        const sanitizedDetails = sanitizeAiRewriteDiagnosticDetails(details ?? {});
+        aiRewriteDiagnostics?.record(event, sanitizedDetails);
+        if (!app.isPackaged) console.info("AI rewrite diagnostic", { event, ...sanitizedDetails });
+      }
+    );
+  }
+  return aiRewriteService;
 }
 
 function tabsRoot(): string {
@@ -383,6 +418,14 @@ function assertRendererStateLoaded(webContentsId: number): void {
 }
 
 function assertTrustedEditorSender(event: Electron.IpcMainInvokeEvent): NovelViewerController {
+  const window = assertTrustedEditorFrame(event);
+  if (!novelViewerController || !novelViewerController.belongsToWindow(window)) {
+    throw new Error("Novel Viewer IPC is only available to the trusted editor frame.");
+  }
+  return novelViewerController;
+}
+
+function assertTrustedEditorFrame(event: Electron.IpcMainInvokeEvent): BrowserWindow {
   const window = BrowserWindow.fromWebContents(event.sender);
   const expectedUrl = pathToFileURL(path.join(__dirname, "../renderer/index.html")).href;
   if (
@@ -390,12 +433,11 @@ function assertTrustedEditorSender(event: Electron.IpcMainInvokeEvent): NovelVie
     window.webContents !== event.sender ||
     event.senderFrame !== window.webContents.mainFrame ||
     event.senderFrame.url !== expectedUrl ||
-    !novelViewerController ||
-    !novelViewerController.belongsToWindow(window)
+    !loadedAppStateWebContents.has(event.sender.id)
   ) {
-    throw new Error("Novel Viewer IPC is only available to the trusted editor frame.");
+    throw new Error("This IPC is only available to the trusted editor frame.");
   }
-  return novelViewerController;
+  return window;
 }
 
 function enqueuePersistenceMutation<T>(operation: () => Promise<T>): Promise<T> {
@@ -528,6 +570,10 @@ function normalizeWorkspace(input: Partial<WorkspaceState>): WorkspaceState {
       accessTeamDomain: typeof input.remoteInbox?.accessTeamDomain === "string" ? input.remoteInbox.accessTeamDomain.trim() : "",
       accessAudience: typeof input.remoteInbox?.accessAudience === "string" ? input.remoteInbox.accessAudience.trim() : "",
       allowedEmail: typeof input.remoteInbox?.allowedEmail === "string" ? input.remoteInbox.allowedEmail.trim() : ""
+    },
+    aiRewrite: {
+      enabled: input.aiRewrite?.enabled !== false,
+      defaultPreset: isAiRewritePresetId(input.aiRewrite?.defaultPreset) ? input.aiRewrite.defaultPreset : defaultWorkspace.aiRewrite.defaultPreset
     },
     layout: normalizedLayout
   };
@@ -1012,6 +1058,14 @@ async function performLifecycleAction(window: BrowserWindow, reason: ShutdownRea
     console.error("Novel Viewer checkpoint failed during lifecycle transition:", error);
   }
 
+  try {
+    await aiRewriteService?.shutdown();
+    aiRewriteService = null;
+    await aiRewriteDiagnostics?.flush();
+  } catch (error) {
+    console.error("AI rewrite cleanup failed during lifecycle transition:", error instanceof Error ? error.name : "UnknownError");
+  }
+
   if (reason === "reload") {
     try {
       await readerController?.suspendForRendererReload(true);
@@ -1178,7 +1232,9 @@ function buildApplicationMenu(): Menu {
         { label: label.globalSearch, accelerator: "CmdOrCtrl+Shift+F", click: () => sendMenuAction("global-search") },
         { label: label.replace, accelerator: "CmdOrCtrl+H", click: () => sendMenuAction("replace") },
         { label: label.findNext, accelerator: "F3", click: () => sendMenuAction("find-next") },
-        { label: label.findPrevious, accelerator: "Shift+F3", click: () => sendMenuAction("find-previous") }
+        { label: label.findPrevious, accelerator: "Shift+F3", click: () => sendMenuAction("find-previous") },
+        { type: "separator" },
+        { label: label.aiRewrite, click: () => sendMenuAction("ai-rewrite") }
       ]
     },
     {
@@ -1355,6 +1411,32 @@ ipcMain.handle("app:recovery:ack", async (event, restore: boolean): Promise<void
       recoveryChoice: restore ? "restore" : "skip"
     });
   });
+});
+
+ipcMain.handle("ai-rewrite:status", async (event): Promise<AiRewriteConnectionStatus> => {
+  assertTrustedEditorFrame(event);
+  const workspace = await loadWorkspace();
+  if (!workspace.aiRewrite.enabled) {
+    return { state: "unavailable", message: "AI文章整形は設定で無効になっています。" };
+  }
+  return getAiRewriteService().status();
+});
+
+ipcMain.handle("ai-rewrite:run", async (event, request: AiRewriteRequest): Promise<AiRewriteResponse> => {
+  assertTrustedEditorFrame(event);
+  if (!request || typeof request.text !== "string" || request.text.length > AI_REWRITE_MAX_CHARACTERS || !isAiRewritePresetId(request.preset)) {
+    throw new Error("Invalid AI rewrite request.");
+  }
+  const workspace = await loadWorkspace();
+  if (!workspace.aiRewrite.enabled) {
+    return { ok: false, code: "disabled", message: "AI文章整形は設定で無効になっています。" };
+  }
+  return getAiRewriteService().run(request);
+});
+
+ipcMain.handle("ai-rewrite:cancel", async (event): Promise<boolean> => {
+  assertTrustedEditorFrame(event);
+  return aiRewriteService?.cancel() ?? false;
 });
 
 ipcMain.handle("novel-viewer:initialize", async (event, restoreAllowed: boolean): Promise<NovelViewerStartupState> => {
@@ -1945,6 +2027,8 @@ app.on("certificate-error", (event, webContents, _url, _error, _certificate, cal
 
 app.on("will-quit", () => {
   void stopRemoteInboxAfterConfiguration();
+  void aiRewriteService?.shutdown();
+  void aiRewriteDiagnostics?.flush();
   if (cleanShutdownApproved) {
     markSessionCleanSync();
   }

@@ -45,6 +45,12 @@ import {
   type NovelViewerStatus,
   type NovelViewerTocState
 } from "../shared/novelViewer";
+import {
+  AI_REWRITE_MAX_CHARACTERS,
+  AI_REWRITE_PRESETS,
+  aiRewritePresetLabel,
+  type AiRewritePresetId
+} from "../shared/aiRewrite";
 
 type MenuAction =
   | "new-tab"
@@ -65,6 +71,7 @@ type MenuAction =
   | "replace"
   | "find-next"
   | "find-previous"
+  | "ai-rewrite"
   | "toggle-theme"
   | "toggle-locale"
   | "open-settings"
@@ -226,6 +233,7 @@ let draggedItem: { type: "tab" | "group"; id: string } | null = null;
 let selectedGroupId: string | null = null;
 let globalSearchTimer: number | null = null;
 let minimapTimer: number | null = null;
+let editorMeasureFrame: number | null = null;
 let globalSearchSequence = 0;
 let globalSearchCache: GlobalSearchResult[] = [];
 let workspaceImportedNeedsRestart = false;
@@ -265,6 +273,17 @@ let novelViewerStatus: NovelViewerStatus = {
   loading: false,
   canGoBack: false,
   canGoForward: false
+};
+let pendingAiRewriteContextTarget: AiRewriteTargetSnapshot | null = null;
+
+type AiRewriteTargetSnapshot = {
+  paneId: PaneId;
+  tabId: string;
+  childTabId: string;
+  from: number;
+  to: number;
+  originalText: string;
+  wholeDocument: boolean;
 };
 
 const UNGROUPED_COLLAPSED_ID = "ungrouped:collapsed";
@@ -2124,6 +2143,18 @@ function applySplitColumns(split = novelViewerOpen ? !novelViewerSinglePane : wo
   updateSplitResizerAccessibility(displayedRatio);
 }
 
+function scheduleVisibleEditorMeasure(): void {
+  if (editorMeasureFrame !== null) return;
+  editorMeasureFrame = window.requestAnimationFrame(() => {
+    editorMeasureFrame = null;
+    (Object.values(panes) as EditorPaneState[]).forEach((pane) => {
+      if (!pane.element.hidden && !pane.host.classList.contains("is-empty")) {
+        pane.view?.requestMeasure();
+      }
+    });
+  });
+}
+
 function applyEditorLayout(): void {
   const split = workspace.layout.splitMode === "vertical";
   editorArea.classList.toggle("is-split", split || novelViewerOpen);
@@ -2139,6 +2170,7 @@ function applyEditorLayout(): void {
   if (novelViewerOpen) {
     applyNovelViewerLayout();
     updatePaneTitles();
+    scheduleVisibleEditorMeasure();
     return;
   }
   if (!split && activePaneId === "right") {
@@ -2147,6 +2179,7 @@ function applyEditorLayout(): void {
     setActivePane(workspace.layout.activePaneId === "right" && split ? "right" : "left");
   }
   updatePaneTitles();
+  scheduleVisibleEditorMeasure();
 }
 
 function recentClosedTabs(): TabMeta[] {
@@ -2592,6 +2625,284 @@ function closeContextMenu(): void {
   document.querySelector(".context-menu")?.remove();
 }
 
+function captureAiRewriteTarget(requireEditorFocus = true): AiRewriteTargetSnapshot | null {
+  const pane = activePane();
+  const view = pane.view;
+  if (
+    !workspace.aiRewrite.enabled ||
+    !view ||
+    !pane.activeTabId ||
+    isRemoteInboxTabId(pane.activeTabId) ||
+    view.state.facet(EditorState.readOnly) ||
+    (requireEditorFocus && !view.hasFocus)
+  ) {
+    return null;
+  }
+  const selection = view.state.selection.main;
+  const wholeDocument = selection.empty;
+  const from = wholeDocument ? 0 : selection.from;
+  const to = wholeDocument ? view.state.doc.length : selection.to;
+  const originalText = view.state.doc.sliceString(from, to);
+  if (!originalText.trim()) return null;
+  return {
+    paneId: pane.id,
+    tabId: pane.activeTabId,
+    childTabId: pane.activeChildTabId,
+    from,
+    to,
+    originalText,
+    wholeDocument
+  };
+}
+
+function aiRewriteTargetStillMatches(snapshot: AiRewriteTargetSnapshot): boolean {
+  const pane = paneForId(snapshot.paneId);
+  const view = pane.view;
+  return Boolean(
+    view &&
+    pane.activeTabId === snapshot.tabId &&
+    pane.activeChildTabId === snapshot.childTabId &&
+    snapshot.from >= 0 &&
+    snapshot.to <= view.state.doc.length &&
+    (!snapshot.wholeDocument || snapshot.to === view.state.doc.length) &&
+    view.state.doc.sliceString(snapshot.from, snapshot.to) === snapshot.originalText
+  );
+}
+
+function aiRewriteLabels() {
+  return workspace.locale === "jp" ? {
+    title: "AIで文章を整える",
+    preset: "整形プリセット",
+    original: "元の文章",
+    result: "整形後の文章",
+    generate: "生成する",
+    generating: "生成中...",
+    cancelGeneration: "生成をキャンセル",
+    rerun: "再実行",
+    apply: "置換して適用",
+    newTab: "新規タブで開く",
+    copy: "コピー",
+    close: "閉じる",
+    changed: "編集中に元の文章が変更されたため、直接置換できません。新規タブまたはコピーを使用してください。",
+    empty: "整形する文章がありません。",
+    unavailable: "この画面ではAI文章整形を実行できません。",
+    copied: "整形結果をコピーしました。",
+    applied: "整形結果を適用しました。",
+    note: "ChatGPTプランのCodex利用枠を使用します。結果を確認してから適用してください。"
+  } : {
+    title: "Rewrite with AI",
+    preset: "Preset",
+    original: "Original",
+    result: "Rewritten",
+    generate: "Generate",
+    generating: "Generating...",
+    cancelGeneration: "Cancel generation",
+    rerun: "Run again",
+    apply: "Replace selection",
+    newTab: "Open in new tab",
+    copy: "Copy",
+    close: "Close",
+    changed: "The source changed while generating. Direct replacement is disabled; use a new tab or copy instead.",
+    empty: "There is no text to rewrite.",
+    unavailable: "AI rewrite is not available for this view.",
+    copied: "Rewritten text copied.",
+    applied: "Rewritten text applied.",
+    note: "Uses the Codex allowance included with your ChatGPT plan. Review the result before applying it."
+  };
+}
+
+function installDialogKeyboardHandling(overlay: HTMLElement, close: () => void): void {
+  overlay.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      close();
+      return;
+    }
+    if (event.key !== "Tab") return;
+    const focusable = [...overlay.querySelectorAll<HTMLElement>('button:not(:disabled), select:not(:disabled), textarea:not(:disabled), [tabindex="0"]')]
+      .filter((element) => !element.hidden && element.offsetParent !== null);
+    if (!focusable.length) return;
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
+    }
+  });
+}
+
+function openAiRewriteDialog(targetOverride?: AiRewriteTargetSnapshot | null): void {
+  closeContextMenu();
+  const labels = aiRewriteLabels();
+  const snapshot = targetOverride ?? captureAiRewriteTarget();
+  pendingAiRewriteContextTarget = null;
+  if (!snapshot) {
+    setSaveState(labels.unavailable, "error");
+    return;
+  }
+  if (snapshot.originalText.length > AI_REWRITE_MAX_CHARACTERS) {
+    setSaveState(`文章は${AI_REWRITE_MAX_CHARACTERS.toLocaleString("ja-JP")}文字以内にしてください。`, "error");
+    return;
+  }
+  document.querySelector(".dialog-overlay")?.remove();
+  const overlay = document.createElement("div");
+  overlay.className = "dialog-overlay ai-rewrite-overlay";
+  overlay.innerHTML = `
+    <section class="app-dialog ai-rewrite-dialog" role="dialog" aria-modal="true" aria-labelledby="ai-rewrite-title">
+      <div class="dialog-title" id="ai-rewrite-title">${escapeHtml(labels.title)}</div>
+      <p class="dialog-note">${escapeHtml(labels.note)}</p>
+      <label class="settings-field ai-rewrite-preset-label">${escapeHtml(labels.preset)}
+        <select class="ai-rewrite-preset">
+          ${AI_REWRITE_PRESETS.map((preset) => `<option value="${preset.id}" ${preset.id === workspace.aiRewrite.defaultPreset ? "selected" : ""}>${escapeHtml(preset.label)}</option>`).join("")}
+        </select>
+      </label>
+      <div class="ai-rewrite-comparison">
+        <label>${escapeHtml(labels.original)}<textarea class="ai-rewrite-original" readonly spellcheck="false"></textarea></label>
+        <label>${escapeHtml(labels.result)}<textarea class="ai-rewrite-result" readonly spellcheck="false"></textarea></label>
+      </div>
+      <p class="ai-rewrite-status" aria-live="polite"></p>
+      <div class="dialog-actions ai-rewrite-actions">
+        <button type="button" data-ai-action="cancel-generation" hidden>${escapeHtml(labels.cancelGeneration)}</button>
+        <button type="button" data-ai-action="generate">${escapeHtml(labels.generate)}</button>
+        <button type="button" data-ai-action="apply" disabled>${escapeHtml(labels.apply)}</button>
+        <button type="button" data-ai-action="new-tab" disabled>${escapeHtml(labels.newTab)}</button>
+        <button type="button" data-ai-action="copy" disabled>${escapeHtml(labels.copy)}</button>
+        <button type="button" data-ai-action="close">${escapeHtml(labels.close)}</button>
+      </div>
+    </section>
+  `;
+  const original = overlay.querySelector<HTMLTextAreaElement>(".ai-rewrite-original")!;
+  const result = overlay.querySelector<HTMLTextAreaElement>(".ai-rewrite-result")!;
+  const status = overlay.querySelector<HTMLElement>(".ai-rewrite-status")!;
+  const preset = overlay.querySelector<HTMLSelectElement>(".ai-rewrite-preset")!;
+  const generateButton = overlay.querySelector<HTMLButtonElement>('[data-ai-action="generate"]')!;
+  const cancelButton = overlay.querySelector<HTMLButtonElement>('[data-ai-action="cancel-generation"]')!;
+  const applyButton = overlay.querySelector<HTMLButtonElement>('[data-ai-action="apply"]')!;
+  const newTabButton = overlay.querySelector<HTMLButtonElement>('[data-ai-action="new-tab"]')!;
+  const copyButton = overlay.querySelector<HTMLButtonElement>('[data-ai-action="copy"]')!;
+  const closeButton = overlay.querySelector<HTMLButtonElement>('[data-ai-action="close"]')!;
+  original.value = snapshot.originalText;
+  let rewrittenText = "";
+  let generating = false;
+  let generationSequence = 0;
+
+  const setResultActions = (enabled: boolean): void => {
+    applyButton.disabled = !enabled;
+    newTabButton.disabled = !enabled;
+    copyButton.disabled = !enabled;
+  };
+  const close = (): void => {
+    generationSequence += 1;
+    if (generating) void window.textEditor.cancelAiRewrite();
+    overlay.remove();
+  };
+  const setGenerating = (value: boolean): void => {
+    generating = value;
+    generateButton.disabled = value;
+    preset.disabled = value;
+    cancelButton.hidden = !value;
+    if (value) {
+      status.textContent = labels.generating;
+      setResultActions(false);
+    }
+  };
+  const run = async (): Promise<void> => {
+    const selectedPreset = preset.value as AiRewritePresetId;
+    const sequence = ++generationSequence;
+    setGenerating(true);
+    rewrittenText = "";
+    result.value = "";
+    try {
+      const response = await window.textEditor.runAiRewrite({ text: snapshot.originalText, preset: selectedPreset });
+      if (sequence !== generationSequence || !overlay.isConnected) return;
+      if (!response.ok) {
+        status.textContent = response.message;
+        status.dataset.mode = "error";
+        return;
+      }
+      rewrittenText = response.rewrittenText;
+      result.value = rewrittenText;
+      const matches = aiRewriteTargetStillMatches(snapshot);
+      applyButton.disabled = !matches;
+      newTabButton.disabled = false;
+      copyButton.disabled = false;
+      status.textContent = matches ? `${aiRewritePresetLabel(selectedPreset)} / ${response.model}` : labels.changed;
+      status.dataset.mode = matches ? "ready" : "error";
+      generateButton.textContent = labels.rerun;
+    } catch (error) {
+      if (sequence === generationSequence && overlay.isConnected) {
+        status.textContent = `${text().actionFailed}: ${errorMessage(error)}`;
+        status.dataset.mode = "error";
+      }
+    } finally {
+      if (sequence === generationSequence && overlay.isConnected) setGenerating(false);
+    }
+  };
+
+  generateButton.addEventListener("click", () => void run());
+  cancelButton.addEventListener("click", () => {
+    generationSequence += 1;
+    void window.textEditor.cancelAiRewrite();
+    setGenerating(false);
+    status.textContent = workspace.locale === "jp" ? "キャンセルしました。" : "Canceled.";
+    status.dataset.mode = "error";
+  });
+  applyButton.addEventListener("click", () => {
+    if (!rewrittenText || !aiRewriteTargetStillMatches(snapshot)) {
+      applyButton.disabled = true;
+      status.textContent = labels.changed;
+      status.dataset.mode = "error";
+      return;
+    }
+    const pane = paneForId(snapshot.paneId);
+    pane.view?.dispatch({
+      changes: { from: snapshot.from, to: snapshot.to, insert: rewrittenText },
+      selection: { anchor: snapshot.from + rewrittenText.length },
+      scrollIntoView: true
+    });
+    setSaveState(labels.applied);
+    close();
+    pane.view?.focus();
+  });
+  newTabButton.addEventListener("click", () => {
+    if (!rewrittenText) return;
+    const selectedPreset = preset.value as AiRewritePresetId;
+    close();
+    void createNewTab(undefined, rewrittenText, `${workspace.locale === "jp" ? "AI整形結果" : "AI rewrite result"} - ${aiRewritePresetLabel(selectedPreset)}`);
+  });
+  copyButton.addEventListener("click", () => {
+    if (!rewrittenText) return;
+    void window.textEditor.writeClipboardText(rewrittenText).then(
+      () => setSaveState(labels.copied),
+      (error: unknown) => setSaveState(`${text().copyFailed}: ${errorMessage(error)}`, "error")
+    );
+  });
+  closeButton.addEventListener("click", close);
+  overlay.addEventListener("click", (event) => {
+    if (event.target === overlay) close();
+  });
+  installDialogKeyboardHandling(overlay, close);
+  document.body.appendChild(overlay);
+  preset.focus();
+}
+
+function showAiRewriteContextMenu(x: number, y: number): void {
+  closeContextMenu();
+  pendingAiRewriteContextTarget = captureAiRewriteTarget(false);
+  const menu = document.createElement("div");
+  menu.className = "context-menu ai-rewrite-context-menu";
+  const button = document.createElement("button");
+  button.type = "button";
+  button.dataset.action = "ai-rewrite";
+  button.textContent = "AIで文章を整える";
+  button.disabled = !pendingAiRewriteContextTarget;
+  menu.appendChild(button);
+  positionContextMenu(menu, x, y);
+}
+
 function positionContextMenu(menu: HTMLElement, x: number, y: number): void {
   document.body.appendChild(menu);
   const rect = menu.getBoundingClientRect();
@@ -2818,6 +3129,18 @@ function openSettingsDialog(): void {
         <input type="checkbox" name="auto-continue-lists" ${workspace.autoContinueLists ? "checked" : ""} />
         <span>${escapeHtml(label.autoContinueLists)}</span>
       </label>
+      <div class="settings-section-title">${workspace.locale === "jp" ? "AI文章整形" : "AI rewrite"}</div>
+      <label class="settings-check">
+        <input type="checkbox" name="ai-rewrite-enabled" ${workspace.aiRewrite.enabled ? "checked" : ""} />
+        <span>${workspace.locale === "jp" ? "AI文章整形を有効にする" : "Enable AI rewrite"}</span>
+      </label>
+      <label class="settings-field">${workspace.locale === "jp" ? "既定プリセット" : "Default preset"}
+        <select name="ai-rewrite-preset">
+          ${AI_REWRITE_PRESETS.map((preset) => `<option value="${preset.id}" ${preset.id === workspace.aiRewrite.defaultPreset ? "selected" : ""}>${escapeHtml(preset.label)}</option>`).join("")}
+        </select>
+      </label>
+      <button type="button" class="secondary-button" data-settings-action="check-ai-rewrite">${workspace.locale === "jp" ? "Codex接続状態を確認" : "Check Codex connection"}</button>
+      <p class="dialog-note" id="ai-rewrite-status">${workspace.locale === "jp" ? "Codex CLIは文章整形を実行するまで起動しません。APIキー従量課金には対応していません。" : "Codex CLI starts only on demand. API-key billing is not supported."}</p>
       <div class="settings-section-title">${workspace.locale === "jp" ? "遠隔書き込み" : "Remote writing"}</div>
       <label class="settings-check"><input type="checkbox" name="remote-enabled" ${workspace.remoteInbox.enabled ? "checked" : ""} /><span>${workspace.locale === "jp" ? "遠隔書き込みを有効にする" : "Enable remote writing"}</span></label>
       <label class="settings-field">${workspace.locale === "jp" ? "ローカル待受ポート" : "Local listening port"}<input name="remote-port" type="number" min="1024" max="65535" value="${workspace.remoteInbox.port}" /></label>
@@ -2852,6 +3175,25 @@ function openSettingsDialog(): void {
     overlay.remove();
     openCustomTemplateEditor();
   });
+  overlay.querySelector<HTMLButtonElement>('[data-settings-action="check-ai-rewrite"]')!.addEventListener("click", () => {
+    const statusElement = overlay.querySelector<HTMLElement>("#ai-rewrite-status");
+    const button = overlay.querySelector<HTMLButtonElement>('[data-settings-action="check-ai-rewrite"]')!;
+    button.disabled = true;
+    if (statusElement) statusElement.textContent = workspace.locale === "jp" ? "確認中..." : "Checking...";
+    void window.textEditor.getAiRewriteStatus().then(
+      (status) => {
+        if (!statusElement || !overlay.isConnected) return;
+        const auth = status.authMode === "chatgpt" ? "Auth: ChatGPT" : status.authMode === "api-key" ? "Auth: API key" : "";
+        const details = [status.message, auth, status.model ? `Model: ${status.model}` : "", status.availableModelCount !== undefined ? `Models: ${status.availableModelCount}` : "", status.resetAt ? `Reset: ${status.resetAt}` : ""].filter(Boolean);
+        statusElement.textContent = details.join(" / ");
+      },
+      (error: unknown) => {
+        if (statusElement && overlay.isConnected) statusElement.textContent = `${text().actionFailed}: ${errorMessage(error)}`;
+      }
+    ).finally(() => {
+      if (overlay.isConnected) button.disabled = false;
+    });
+  });
   void window.textEditor.remoteInboxStatus().then((status) => {
     const statusElement = overlay.querySelector("#remote-status");
     if (statusElement) statusElement.textContent = status.state === "running" ? `${workspace.locale === "jp" ? "起動中" : "Running"}: ${status.url}` : status.state === "error" ? `${workspace.locale === "jp" ? "エラー" : "Error"}: ${status.message}` : (workspace.locale === "jp" ? "停止中" : "Stopped");
@@ -2863,6 +3205,9 @@ function openSettingsDialog(): void {
     const value = new FormData(form).get("new-tab-template");
     const newTabTemplate = value === "novel" || value === "reference" || value === "custom" ? value : "simple";
     const autoContinueLists = Boolean(form.querySelector<HTMLInputElement>('input[name="auto-continue-lists"]')?.checked);
+    const aiRewriteEnabled = Boolean(form.querySelector<HTMLInputElement>('input[name="ai-rewrite-enabled"]')?.checked);
+    const aiRewritePresetValue = form.querySelector<HTMLSelectElement>('select[name="ai-rewrite-preset"]')?.value;
+    const aiRewritePreset: AiRewritePresetId = aiRewritePresetValue === "light" || aiRewritePresetValue === "review" ? aiRewritePresetValue : "formalize";
     const port = Number(form.querySelector<HTMLInputElement>('input[name="remote-port"]')?.value);
     const targetTabName = form.querySelector<HTMLInputElement>('input[name="remote-tab"]')?.value.trim() ?? "";
     const configuredTargetNames = (form.querySelector<HTMLTextAreaElement>('textarea[name="remote-targets"]')?.value ?? "").split(/\r?\n/).map((name) => name.trim()).filter((name, index, names) => Boolean(name) && name.length <= 120 && !/[\u0000-\u001F\u007F]/.test(name) && names.indexOf(name) === index);
@@ -2896,6 +3241,7 @@ function openSettingsDialog(): void {
       }
       workspace.newTabTemplate = newTabTemplate;
       workspace.autoContinueLists = autoContinueLists;
+      workspace.aiRewrite = { enabled: aiRewriteEnabled, defaultPreset: aiRewritePreset };
       workspace.remoteInbox = { enabled: remoteEnabled, port, targetTabName, targetTabNames, remoteReadableTabIds, includeTimestamp, notifyOnReceive, accessTeamDomain, accessAudience, allowedEmail };
       workspace.templates = {
         ...workspace.templates,
@@ -3313,7 +3659,11 @@ async function openTabInPane(id: string, paneId: PaneId, childTabId?: string): P
   paneForId(paneId).view?.focus();
 }
 
-async function createNewTab(targetGroupIdOverride?: string | null): Promise<void> {
+async function createNewTab(
+  targetGroupIdOverride?: string | null,
+  initialContent = "",
+  titleOverride?: string
+): Promise<void> {
   if (creatingTab) {
     return;
   }
@@ -3325,10 +3675,10 @@ async function createNewTab(targetGroupIdOverride?: string | null): Promise<void
     const updatedAt = nowIso();
     const tab: TabDocument = {
       id,
-      title: nextUntitledTitle(),
-      content: "",
+      title: titleOverride?.trim() || nextUntitledTitle(),
+      content: initialContent,
       activeChildTabId: MAIN_CHILD_TAB_ID,
-      childTabs: childTabsFromTemplate("", updatedAt),
+      childTabs: childTabsFromTemplate(initialContent, updatedAt),
       updatedAt
     };
 
@@ -3347,10 +3697,11 @@ async function createNewTab(targetGroupIdOverride?: string | null): Promise<void
     workspace.recentTabIds = [id, ...workspace.recentTabIds.filter((entry) => entry !== id)].slice(0, 20);
     workspace.expandedIds = Array.from(new Set([...workspace.expandedIds, "opened"]));
     syncActiveTabId();
-    setPaneEditorContent(activePane(), "");
+    setPaneEditorContent(activePane(), initialContent);
     setPaneEditorEnabled(activePane(), true);
     renderSidebar();
     updateStatus();
+    if (!titleOverride) focusTitleForPane(activePaneId, true);
     const saved = ensureTab(await window.textEditor.saveTab(normalized));
     contentCache.set(id, saved);
     updateMetaFromDocument(saved);
@@ -3359,7 +3710,6 @@ async function createNewTab(targetGroupIdOverride?: string | null): Promise<void
     await saveWorkspace();
     renderSidebar();
     setSaveState(text().newTabCreated);
-    focusTitleForPane(activePaneId, true);
   } catch (error) {
     setSaveState(`${text().newTabFailed}: ${errorMessage(error)}`, "error");
     console.error(error);
@@ -4301,6 +4651,7 @@ async function performAction(
   else if (action === "export-workspace") await exportWorkspace();
   else if (action === "import-workspace") await importWorkspace();
   else if (action === "global-search") openGlobalSearchPane();
+  else if (action === "ai-rewrite") openAiRewriteDialog(source ? pendingAiRewriteContextTarget : null);
   else if (action === "close-global-search") closeGlobalSearchPane();
   else if (action === "open-search-result" && options.source?.dataset.resultIndex) await openSearchResult(Number(options.source.dataset.resultIndex));
   else if (action === "split-right") await splitRight();
@@ -4417,6 +4768,13 @@ globalSearchInput.addEventListener("keydown", (event) => {
 
 document.addEventListener("contextmenu", (event) => {
   const target = event.target as HTMLElement;
+  if (target.closest(".cm-content")) {
+    event.preventDefault();
+    const paneElement = target.closest<HTMLElement>(".editor-pane[data-pane-id]");
+    setActivePane(paneElement?.dataset.paneId === "right" ? "right" : "left");
+    showAiRewriteContextMenu(event.clientX, event.clientY);
+    return;
+  }
   const childButton = target.closest<HTMLElement>(".child-tab-button[data-id][data-child-id]");
   if (childButton) {
     event.preventDefault();

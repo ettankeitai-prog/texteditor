@@ -19,6 +19,11 @@ import type {
   NovelViewerTocState,
   NovelViewerUiLayoutUpdate
 } from "../shared/novelViewer.js";
+import type {
+  AiRewriteConnectionStatus,
+  AiRewriteRequest,
+  AiRewriteResponse
+} from "../shared/aiRewrite.js";
 
 type MenuAction =
   | "new-tab"
@@ -39,6 +44,7 @@ type MenuAction =
   | "replace"
   | "find-next"
   | "find-previous"
+  | "ai-rewrite"
   | "toggle-theme"
   | "toggle-locale"
   | "open-settings"
@@ -112,6 +118,9 @@ const api = {
     return result;
   },
   writeClipboardText: (text: string): Promise<void> => ipcRenderer.invoke("clipboard:writeText", text),
+  getAiRewriteStatus: (): Promise<AiRewriteConnectionStatus> => ipcRenderer.invoke("ai-rewrite:status"),
+  runAiRewrite: (request: AiRewriteRequest): Promise<AiRewriteResponse> => ipcRenderer.invoke("ai-rewrite:run", request),
+  cancelAiRewrite: (): Promise<boolean> => ipcRenderer.invoke("ai-rewrite:cancel"),
   remoteInboxStatus: (): Promise<{ state: "stopped" | "running" | "error"; message?: string; url?: string }> => ipcRenderer.invoke("remote-inbox:status"),
   onRemoteInboxAppend: (callback: (request: { id: string; text: string; includeTimestamp: boolean; targetTabName: string }) => Promise<void>): (() => void) => {
     const listener = (_event: Electron.IpcRendererEvent, request: { id: string; text: string; includeTimestamp: boolean; targetTabName: string }): void => {

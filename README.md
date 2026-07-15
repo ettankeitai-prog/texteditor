@@ -2,6 +2,24 @@
 
 Electron + TypeScript + CodeMirror 6 で作成した、軽量な小説・日常メモ用テキストエディタです。
 
+## v2.1.0
+
+v2.1.0 は、選択範囲またはタブ全文を人が確認してから適用できる「AI文章整形」を追加するリリースです。
+
+- 「軽く整える」「正文化」「レビュー整形」の3プリセット
+- 右クリックメニューとアプリの編集メニューから起動
+- 元文と整形結果を比較し、置換・新規タブ・コピーを選択可能
+- 生成中に元文が変わった場合は直接置換を拒否し、CodeMirror transactionによる置換はUndo可能
+- Electron main processが公式`codex app-server`を必要時だけ起動し、ローカルstdioのJSON-RPCと限定IPCでrendererから分離
+- Codex CLIとChatGPTアカウントのCodex利用枠が必要（Codexの利用資格があるプランが対象）
+- OpenAI APIキーによる従量課金とChatGPT Web画面の自動操作には非対応
+- Codex未導入、未ログイン、利用枠到達、App Server異常時も通常編集・保存は継続可能
+- 本文・整形結果・認証情報をアプリの診断ログへ保存しない
+
+選択範囲がある場合はその範囲、未選択の場合は現在タブ全文が対象です。利用前にCodex CLIをインストールし、`codex login`でChatGPTアカウントへログインしてください。AI出力は自動適用されず、必ず比較ダイアログで確認します。
+
+Electron mainは`where.exe`、mainプロセスの`PATH`、OpenAI Codexの標準インストール先の順で実行可能なCLIを解決します。明示する場合は起動環境の`TEXTEDITOR_CODEX_EXECUTABLE`へ`codex.exe`の絶対パスを設定できます。接続診断は`userData/ai-rewrite/ai-rewrite-debug.log`へ記録されますが、対象本文、生成結果、認証情報は記録しません。
+
 ## v2.0.0
 
 v2.0.0 は、通常文書から分離した安全なNovel Viewerと、カクヨム／小説家になろう対応の目次機能を追加するリリースです。
@@ -69,8 +87,8 @@ npm run dist
 
 ```text
 dist/
-  Text Editor Setup 2.0.0.exe
-  Text Editor 2.0.0.exe
+  Text Editor Setup 2.1.0.exe
+  Text Editor 2.1.0.exe
 ```
 
 開発中にレンダラーだけ確認する場合:
@@ -103,6 +121,8 @@ npm run test:e2e:ui
 
 主な確認範囲:
 
+- AI文章整形の選択範囲／全文対象、3プリセット、比較、置換、Undo、新規タブ、コピー、キャンセル、競合拒否
+- モックApp ServerによるJSON-RPC、通知、タイムアウト、異常終了、認証・利用枠エラー（実サービスの利用枠は消費しません）
 - 自動保存
 - 上部タブ名からのリネーム
 - 全文コピー
@@ -551,7 +571,7 @@ version.json
 
 ```json
 {
-  "appVersion": "2.0.0",
+  "appVersion": "2.1.0",
   "workspaceVersion": 1,
   "createdAt": "2026-07-08T12:00:00.000Z"
 }
