@@ -9,6 +9,13 @@ import {
   WorkspaceState,
   WorkspaceTransferResult
 } from "../shared/schema.js";
+import type {
+  NovelViewerBoundsUpdate,
+  NovelViewerOcclusionUpdate,
+  NovelViewerRendererDiagnosticSnapshot,
+  NovelViewerStartupState,
+  NovelViewerStatus
+} from "../shared/novelViewer.js";
 
 type MenuAction =
   | "new-tab"
@@ -36,6 +43,9 @@ type MenuAction =
   | "close-split"
   | "focus-left"
   | "focus-right"
+  | "toggle-novel-viewer"
+  | "focus-novel-viewer-address"
+  | "close-novel-viewer"
   | "font-up"
   | "font-down"
   | "reload-app";
@@ -119,6 +129,50 @@ const api = {
     const listener = (_event: Electron.IpcRendererEvent, action: MenuAction): void => callback(action);
     ipcRenderer.on("menu:action", listener);
     return () => ipcRenderer.removeListener("menu:action", listener);
+  },
+  initializeNovelViewer: (restoreAllowed: boolean): Promise<NovelViewerStartupState> =>
+    ipcRenderer.invoke("novel-viewer:initialize", restoreAllowed),
+  openNovelViewer: (): Promise<NovelViewerStatus> => ipcRenderer.invoke("novel-viewer:open"),
+  closeNovelViewer: (): Promise<NovelViewerStatus> => ipcRenderer.invoke("novel-viewer:close"),
+  navigateNovelViewer: (url: string): Promise<NovelViewerStatus> => ipcRenderer.invoke("novel-viewer:navigate", url),
+  goBackNovelViewer: (): Promise<NovelViewerStatus> => ipcRenderer.invoke("novel-viewer:back"),
+  goForwardNovelViewer: (): Promise<NovelViewerStatus> => ipcRenderer.invoke("novel-viewer:forward"),
+  reloadOrStopNovelViewer: (): Promise<NovelViewerStatus> => ipcRenderer.invoke("novel-viewer:reload-or-stop"),
+  openNovelViewerExternal: (): Promise<boolean> => ipcRenderer.invoke("novel-viewer:open-external"),
+  updateNovelViewerBounds: (update: NovelViewerBoundsUpdate): Promise<void> => ipcRenderer.invoke("novel-viewer:bounds", update),
+  setNovelViewerOcclusion: (update: NovelViewerOcclusionUpdate): Promise<void> => ipcRenderer.invoke("novel-viewer:occlusion", update),
+  focusNovelViewerRemote: (): Promise<void> => ipcRenderer.invoke("novel-viewer:focus-remote"),
+  onNovelViewerState: (callback: (status: NovelViewerStatus) => void): (() => void) => {
+    const listener = (_event: Electron.IpcRendererEvent, status: NovelViewerStatus): void => callback(status);
+    ipcRenderer.on("novel-viewer:state", listener);
+    return () => ipcRenderer.removeListener("novel-viewer:state", listener);
+  },
+  onNovelViewerFocusAddress: (callback: () => void): (() => void) => {
+    const listener = (): void => callback();
+    ipcRenderer.on("novel-viewer:focus-address", listener);
+    return () => ipcRenderer.removeListener("novel-viewer:focus-address", listener);
+  },
+  onNovelViewerRequestClose: (callback: () => void): (() => void) => {
+    const listener = (): void => callback();
+    ipcRenderer.on("novel-viewer:request-close", listener);
+    return () => ipcRenderer.removeListener("novel-viewer:request-close", listener);
+  },
+  onNovelViewerScrollRestoreWarning: (callback: () => void): (() => void) => {
+    const listener = (): void => callback();
+    ipcRenderer.on("novel-viewer:scroll-restore-warning", listener);
+    return () => ipcRenderer.removeListener("novel-viewer:scroll-restore-warning", listener);
+  },
+  onNovelViewerRequestBounds: (callback: () => void): (() => void) => {
+    const listener = (): void => callback();
+    ipcRenderer.on("novel-viewer:request-bounds", listener);
+    return () => ipcRenderer.removeListener("novel-viewer:request-bounds", listener);
+  },
+  submitNovelViewerDiagnosticSnapshot: (reason: string, snapshot: NovelViewerRendererDiagnosticSnapshot): Promise<void> =>
+    ipcRenderer.invoke("novel-viewer:diagnostic-renderer-snapshot", reason, snapshot),
+  onNovelViewerRequestDiagnosticSnapshot: (callback: (reason: string) => void): (() => void) => {
+    const listener = (_event: Electron.IpcRendererEvent, reason: string): void => callback(reason);
+    ipcRenderer.on("novel-viewer:request-diagnostic-snapshot", listener);
+    return () => ipcRenderer.removeListener("novel-viewer:request-diagnostic-snapshot", listener);
   }
 };
 

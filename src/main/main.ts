@@ -1,9 +1,10 @@
 import AdmZip from "adm-zip";
-import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, Notification } from "electron";
+import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, Notification, protocol } from "electron";
 import type { OpenDialogOptions } from "electron";
 import { existsSync, mkdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import {
   AppStateSnapshot,
   BackupMeta,
@@ -30,6 +31,20 @@ import {
   normalizeTabsIndex
 } from "../shared/schema.js";
 import { RemoteInboxServer, type RemoteInboxMutationResult, type RemoteInboxStatus } from "./remoteInbox.js";
+import { NovelViewerController } from "./novelViewerController.js";
+import {
+  NovelViewerDiagnostics,
+  shouldEnableNovelViewerDiagnostics,
+  shouldShowNovelViewerDiagnosticMenu
+} from "./novelViewerDiagnostics.js";
+import { ReaderStateStore } from "./readerState.js";
+import type {
+  NovelViewerBoundsUpdate,
+  NovelViewerOcclusionUpdate,
+  NovelViewerRendererDiagnosticSnapshot,
+  NovelViewerStartupState,
+  NovelViewerStatus
+} from "../shared/novelViewer.js";
 
 type MenuAction =
   | "new-tab"
@@ -57,6 +72,9 @@ type MenuAction =
   | "close-split"
   | "focus-left"
   | "focus-right"
+  | "toggle-novel-viewer"
+  | "focus-novel-viewer-address"
+  | "close-novel-viewer"
   | "font-up"
   | "font-down"
   | "reload-app";
@@ -66,6 +84,12 @@ type ShutdownResponse = { ok: boolean; error?: string };
 type WorkspacePersistenceState = "ready" | "importing" | "restart-required" | "shutting-down";
 
 app.setName("texteditor");
+if (!app.isPackaged && process.env.TEXTEDITOR_NOVEL_VIEWER_TEST_MODE === "1") {
+  protocol.registerSchemesAsPrivileged([{
+    scheme: "novel-reader-test",
+    privileges: { standard: true, secure: true, supportFetchAPI: true }
+  }]);
+}
 
 let currentLocale: Locale = "en";
 let startupRecoveryState: RecoveryState = { abnormalShutdown: false };
@@ -78,6 +102,7 @@ let jsonWriteSequence = 0;
 let allowAppQuit = false;
 let cleanShutdownApproved = false;
 let activeLifecycleAction: { reason: ShutdownReason; promise: Promise<boolean> } | null = null;
+let novelViewerController: NovelViewerController | null = null;
 const windowsAllowedToClose = new WeakSet<BrowserWindow>();
 const shutdownReadyWebContents = new Set<number>();
 const loadedAppStateWebContents = new Set<number>();
@@ -121,6 +146,11 @@ const menuLabels: Record<
     closeSplit: string;
     focusLeft: string;
     focusRight: string;
+    novelViewer: string;
+    focusNovelViewerAddress: string;
+    closeNovelViewer: string;
+    dumpNovelViewerState: string;
+    bringNovelViewerToFront: string;
     fontSizeUp: string;
     fontSizeDown: string;
     reload: string;
@@ -156,6 +186,11 @@ const menuLabels: Record<
     closeSplit: "Close Split",
     focusLeft: "Focus Left Editor",
     focusRight: "Focus Right Editor",
+    novelViewer: "Novel Viewer",
+    focusNovelViewerAddress: "Focus Novel Viewer URL",
+    closeNovelViewer: "Close Novel Viewer",
+    dumpNovelViewerState: "Dump Novel Viewer State",
+    bringNovelViewerToFront: "Bring Novel Viewer To Front",
     fontSizeUp: "Font Size Up",
     fontSizeDown: "Font Size Down",
     reload: "Reload",
@@ -190,6 +225,11 @@ const menuLabels: Record<
     closeSplit: "分割を閉じる",
     focusLeft: "左エディタへフォーカス",
     focusRight: "右エディタへフォーカス",
+    novelViewer: "Novel Viewer",
+    focusNovelViewerAddress: "Novel ViewerのURL欄へフォーカス",
+    closeNovelViewer: "Novel Viewerを閉じる",
+    dumpNovelViewerState: "Novel Viewer状態を診断ログへ出力",
+    bringNovelViewerToFront: "Novel Viewerを診断用に最前面へ移動",
     fontSizeUp: "フォントサイズを大きく",
     fontSizeDown: "フォントサイズを小さく",
     reload: "再読み込み",
@@ -221,6 +261,14 @@ function workspacePath(): string {
 
 function sessionPath(): string {
   return path.join(dataRoot(), "session.json");
+}
+
+function readerStatePath(): string {
+  return path.join(app.getPath("userData"), "reader", "state.json");
+}
+
+function novelViewerDebugLogPath(): string {
+  return path.join(app.getPath("userData"), "reader", "novel-viewer-debug.log");
 }
 
 function tabsRoot(): string {
@@ -324,6 +372,22 @@ function assertRendererStateLoaded(webContentsId: number): void {
   if (!loadedAppStateWebContents.has(webContentsId)) {
     throw new Error("The workspace is still loading. No data was saved.");
   }
+}
+
+function assertTrustedEditorSender(event: Electron.IpcMainInvokeEvent): NovelViewerController {
+  const window = BrowserWindow.fromWebContents(event.sender);
+  const expectedUrl = pathToFileURL(path.join(__dirname, "../renderer/index.html")).href;
+  if (
+    !window ||
+    window.webContents !== event.sender ||
+    event.senderFrame !== window.webContents.mainFrame ||
+    event.senderFrame.url !== expectedUrl ||
+    !novelViewerController ||
+    !novelViewerController.belongsToWindow(window)
+  ) {
+    throw new Error("Novel Viewer IPC is only available to the trusted editor frame.");
+  }
+  return novelViewerController;
 }
 
 function enqueuePersistenceMutation<T>(operation: () => Promise<T>): Promise<T> {
@@ -933,7 +997,19 @@ async function performLifecycleAction(window: BrowserWindow, reason: ShutdownRea
     await waitForPersistenceIdle();
   }
 
+  const readerController = novelViewerController?.belongsToWindow(window) ? novelViewerController : null;
+  try {
+    await readerController?.checkpointBeforeLifecycle();
+  } catch (error) {
+    console.error("Novel Viewer checkpoint failed during lifecycle transition:", error);
+  }
+
   if (reason === "reload") {
+    try {
+      await readerController?.suspendForRendererReload(true);
+    } catch (error) {
+      console.error("Novel Viewer cleanup failed before reload:", error);
+    }
     if (!window.isDestroyed() && !window.webContents.isDestroyed()) {
       shutdownReadyWebContents.delete(window.webContents.id);
       setImmediate(() => {
@@ -948,6 +1024,12 @@ async function performLifecycleAction(window: BrowserWindow, reason: ShutdownRea
 
   if (saveResult.ok && shouldStopRemoteInbox) {
     await stopRemoteInboxAfterConfiguration();
+  }
+
+  try {
+    await readerController?.shutdown(true);
+  } catch (error) {
+    console.error("Novel Viewer cleanup failed during shutdown:", error);
   }
 
   cleanShutdownApproved = saveResult.ok;
@@ -1005,6 +1087,16 @@ function createWindow(): void {
     }
   });
   const webContentsId = mainWindow.webContents.id;
+  const readerDiagnostics = new NovelViewerDiagnostics(
+    novelViewerDebugLogPath(),
+    shouldEnableNovelViewerDiagnostics(app.isPackaged, process.env.TEXTEDITOR_NOVEL_VIEWER_DEBUG)
+  );
+  const readerController = new NovelViewerController(
+    mainWindow,
+    new ReaderStateStore(readerStatePath()),
+    readerDiagnostics
+  );
+  novelViewerController = readerController;
 
   mainWindow.on("close", (event) => {
     if (windowsAllowedToClose.has(mainWindow)) {
@@ -1024,6 +1116,14 @@ function createWindow(): void {
       pendingShutdownRequests.delete(id);
       pending.resolve({ ok: false, error: "The editor process stopped before saving completed." });
     }
+  });
+  mainWindow.on("closed", () => {
+    if (novelViewerController === readerController) {
+      novelViewerController = null;
+    }
+    void readerController.shutdown().catch((error) => {
+      console.error("Novel Viewer cleanup failed after window close:", error);
+    });
   });
   void mainWindow.loadFile(path.join(__dirname, "../renderer/index.html"));
 }
@@ -1084,6 +1184,31 @@ function buildApplicationMenu(): Menu {
         { label: label.closeSplit, click: () => sendMenuAction("close-split") },
         { label: label.focusLeft, accelerator: "CmdOrCtrl+1", click: () => sendMenuAction("focus-left") },
         { label: label.focusRight, accelerator: "CmdOrCtrl+2", click: () => sendMenuAction("focus-right") },
+        { type: "separator" },
+        { label: label.novelViewer, accelerator: "CmdOrCtrl+Shift+V", click: () => sendMenuAction("toggle-novel-viewer") },
+        { label: label.focusNovelViewerAddress, accelerator: "CmdOrCtrl+L", click: () => sendMenuAction("focus-novel-viewer-address") },
+        { label: label.closeNovelViewer, accelerator: "CmdOrCtrl+Shift+W", click: () => sendMenuAction("close-novel-viewer") },
+        ...(shouldShowNovelViewerDiagnosticMenu(app.isPackaged) ? [
+          { type: "separator" as const },
+          {
+            id: "novel-viewer-diagnostic-dump",
+            label: label.dumpNovelViewerState,
+            click: () => {
+              void novelViewerController?.dumpDiagnosticState("menu-dump").catch((error) =>
+                console.error("Failed to dump Novel Viewer diagnostics:", error)
+              );
+            }
+          },
+          {
+            id: "novel-viewer-diagnostic-bring-to-front",
+            label: label.bringNovelViewerToFront,
+            click: () => {
+              void novelViewerController?.bringToFrontForDiagnostics().catch((error) =>
+                console.error("Failed to bring Novel Viewer to front:", error)
+              );
+            }
+          }
+        ] : []),
         { type: "separator" },
         { label: label.fontSizeUp, accelerator: "CmdOrCtrl+Plus", click: () => sendMenuAction("font-up") },
         { label: label.fontSizeDown, accelerator: "CmdOrCtrl+-", click: () => sendMenuAction("font-down") },
@@ -1222,6 +1347,60 @@ ipcMain.handle("app:recovery:ack", async (event, restore: boolean): Promise<void
     });
   });
 });
+
+ipcMain.handle("novel-viewer:initialize", async (event, restoreAllowed: boolean): Promise<NovelViewerStartupState> => {
+  if (typeof restoreAllowed !== "boolean") throw new Error("Invalid Novel Viewer recovery option.");
+  return assertTrustedEditorSender(event).initialize(restoreAllowed);
+});
+
+ipcMain.handle("novel-viewer:open", async (event): Promise<NovelViewerStatus> =>
+  assertTrustedEditorSender(event).open()
+);
+
+ipcMain.handle("novel-viewer:close", async (event): Promise<NovelViewerStatus> =>
+  assertTrustedEditorSender(event).close()
+);
+
+ipcMain.handle("novel-viewer:navigate", async (event, url: string): Promise<NovelViewerStatus> => {
+  if (typeof url !== "string" || url.length > 4096) throw new Error("Invalid Novel Viewer URL.");
+  return assertTrustedEditorSender(event).navigate(url);
+});
+
+ipcMain.handle("novel-viewer:back", async (event): Promise<NovelViewerStatus> =>
+  assertTrustedEditorSender(event).goBack()
+);
+
+ipcMain.handle("novel-viewer:forward", async (event): Promise<NovelViewerStatus> =>
+  assertTrustedEditorSender(event).goForward()
+);
+
+ipcMain.handle("novel-viewer:reload-or-stop", async (event): Promise<NovelViewerStatus> =>
+  assertTrustedEditorSender(event).reloadOrStop()
+);
+
+ipcMain.handle("novel-viewer:open-external", async (event): Promise<boolean> =>
+  assertTrustedEditorSender(event).openExternal()
+);
+
+ipcMain.handle("novel-viewer:bounds", async (event, update: NovelViewerBoundsUpdate): Promise<void> => {
+  assertTrustedEditorSender(event).updateBounds(update);
+});
+
+ipcMain.handle("novel-viewer:occlusion", async (event, update: NovelViewerOcclusionUpdate): Promise<void> => {
+  assertTrustedEditorSender(event).setOcclusion(update);
+});
+
+ipcMain.handle("novel-viewer:focus-remote", async (event): Promise<void> => {
+  assertTrustedEditorSender(event).focusRemote();
+});
+
+ipcMain.handle(
+  "novel-viewer:diagnostic-renderer-snapshot",
+  async (event, reason: string, snapshot: NovelViewerRendererDiagnosticSnapshot): Promise<void> => {
+    if (typeof reason !== "string" || reason.length > 120) throw new Error("Invalid Novel Viewer diagnostic reason.");
+    assertTrustedEditorSender(event).recordRendererDiagnosticSnapshot(reason, snapshot);
+  }
+);
 
 ipcMain.handle("app:quit", async (event): Promise<boolean> => {
   const window = BrowserWindow.fromWebContents(event.sender);
@@ -1703,6 +1882,12 @@ app.on("before-quit", (event) => {
   }
   allowAppQuit = true;
   app.quit();
+});
+
+app.on("certificate-error", (event, webContents, _url, _error, _certificate, callback) => {
+  if (!novelViewerController?.handleCertificateError(webContents)) return;
+  event.preventDefault();
+  callback(false);
 });
 
 app.on("will-quit", () => {

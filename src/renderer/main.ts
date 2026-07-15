@@ -28,6 +28,11 @@ import {
   normalizeTabDocument,
   normalizeTabsIndex
 } from "../shared/schema";
+import type {
+  NovelViewerOcclusionReason,
+  NovelViewerRendererDiagnosticSnapshot,
+  NovelViewerStatus
+} from "../shared/novelViewer";
 
 type MenuAction =
   | "new-tab"
@@ -55,6 +60,9 @@ type MenuAction =
   | "close-split"
   | "focus-left"
   | "focus-right"
+  | "toggle-novel-viewer"
+  | "focus-novel-viewer-address"
+  | "close-novel-viewer"
   | "font-up"
   | "font-down"
   | "reload-app";
@@ -104,6 +112,19 @@ app.innerHTML = `
             </div>
             <div class="editor-host" id="right-editor-host" data-testid="editor-host-right"></div>
           </section>
+          <section class="novel-viewer-pane" id="novel-viewer-pane" data-testid="novel-viewer-pane" hidden>
+            <form class="novel-viewer-header" id="novel-viewer-address-form">
+              <button type="button" class="novel-viewer-button" id="novel-viewer-back" data-action="novel-viewer-back" aria-label="Back" title="Back">←</button>
+              <button type="button" class="novel-viewer-button" id="novel-viewer-forward" data-action="novel-viewer-forward" aria-label="Forward" title="Forward">→</button>
+              <button type="button" class="novel-viewer-button" id="novel-viewer-reload" data-action="novel-viewer-reload" aria-label="Reload" title="Reload">↻</button>
+              <input class="novel-viewer-address" id="novel-viewer-address" type="text" inputmode="url" autocomplete="off" spellcheck="false" aria-label="Novel Viewer URL" placeholder="https://kakuyomu.jp/…" />
+              <button type="button" class="novel-viewer-button" id="novel-viewer-external" data-action="novel-viewer-external" aria-label="Open in external browser" title="Open in external browser">↗</button>
+              <button type="button" class="novel-viewer-button" id="novel-viewer-close" data-action="novel-viewer-close" aria-label="Close Novel Viewer" title="Close Novel Viewer">×</button>
+            </form>
+            <div class="novel-viewer-slot" id="novel-viewer-slot" tabindex="0">
+              <div class="novel-viewer-local-state" id="novel-viewer-local-state" aria-live="polite"></div>
+            </div>
+          </section>
         </div>
       </main>
       <aside class="minimap-panel">
@@ -131,6 +152,16 @@ const editorSplit = document.querySelector<HTMLDivElement>("#editor-split")!;
 const splitResizer = document.querySelector<HTMLDivElement>("#split-resizer")!;
 const leftPaneElement = document.querySelector<HTMLElement>('[data-pane-id="left"]')!;
 const rightPaneElement = document.querySelector<HTMLElement>('[data-pane-id="right"]')!;
+const novelViewerPane = document.querySelector<HTMLElement>("#novel-viewer-pane")!;
+const novelViewerSlot = document.querySelector<HTMLDivElement>("#novel-viewer-slot")!;
+const novelViewerLocalState = document.querySelector<HTMLDivElement>("#novel-viewer-local-state")!;
+const novelViewerAddressForm = document.querySelector<HTMLFormElement>("#novel-viewer-address-form")!;
+const novelViewerAddress = document.querySelector<HTMLInputElement>("#novel-viewer-address")!;
+const novelViewerBack = document.querySelector<HTMLButtonElement>("#novel-viewer-back")!;
+const novelViewerForward = document.querySelector<HTMLButtonElement>("#novel-viewer-forward")!;
+const novelViewerReload = document.querySelector<HTMLButtonElement>("#novel-viewer-reload")!;
+const novelViewerExternal = document.querySelector<HTMLButtonElement>("#novel-viewer-external")!;
+const novelViewerClose = document.querySelector<HTMLButtonElement>("#novel-viewer-close")!;
 const leftEditorHost = document.querySelector<HTMLDivElement>("#left-editor-host")!;
 const rightEditorHost = document.querySelector<HTMLDivElement>("#right-editor-host")!;
 const leftPaneTitle = document.querySelector<HTMLInputElement>("#left-pane-title")!;
@@ -167,6 +198,21 @@ let appStateLoaded = false;
 let bootstrapReadyForClose = false;
 let statusContentCache = "";
 let statusCharacterCountCache = 0;
+let novelViewerOpen = false;
+let novelViewerSinglePane = false;
+let novelViewerAddressDirty = false;
+let novelViewerLayoutRevision = 0;
+let novelViewerBoundsFrame: number | null = null;
+let novelViewerOcclusionRevision = 0;
+let novelViewerOcclusionReasons = new Set<NovelViewerOcclusionReason>();
+let lastPlaceholderDiagnosticSignature = "";
+let novelViewerStatus: NovelViewerStatus = {
+  lifecycle: "closed",
+  isOpen: false,
+  loading: false,
+  canGoBack: false,
+  canGoForward: false
+};
 
 const UNGROUPED_COLLAPSED_ID = "ungrouped:collapsed";
 const SPLIT_PANE_MIN_WIDTH = 320;
@@ -1492,6 +1538,266 @@ function setActivePane(id: PaneId): void {
   updateStatus();
 }
 
+function novelViewerText() {
+  return workspace.locale === "jp"
+    ? {
+        back: "戻る",
+        forward: "進む",
+        reload: "再読み込み",
+        stop: "停止",
+        external: "外部ブラウザで開く",
+        close: "Novel Viewerを閉じる",
+        address: "Novel Viewer URL",
+        empty: "カクヨムまたは小説家になろうの公開作品URLを入力してください。",
+        loading: "ページを読み込んでいます…",
+        restoreWarning: "保存したスクロール位置を復元できませんでした。"
+      }
+    : {
+        back: "Back",
+        forward: "Forward",
+        reload: "Reload",
+        stop: "Stop",
+        external: "Open in external browser",
+        close: "Close Novel Viewer",
+        address: "Novel Viewer URL",
+        empty: "Enter a public Kakuyomu or Shōsetsuka ni Narō URL.",
+        loading: "Loading page…",
+        restoreWarning: "The saved reading position could not be restored."
+      };
+}
+
+function applyNovelViewerLabels(): void {
+  const label = novelViewerText();
+  const controls: Array<[HTMLElement, string]> = [
+    [novelViewerBack, label.back],
+    [novelViewerForward, label.forward],
+    [novelViewerReload, novelViewerStatus.loading ? label.stop : label.reload],
+    [novelViewerExternal, label.external],
+    [novelViewerClose, label.close]
+  ];
+  controls.forEach(([control, value]) => {
+    control.setAttribute("aria-label", value);
+    control.setAttribute("title", value);
+  });
+  novelViewerAddress.setAttribute("aria-label", label.address);
+}
+
+function renderNovelViewerStatus(status = novelViewerStatus): void {
+  novelViewerStatus = status;
+  novelViewerBack.disabled = !status.canGoBack || status.loading;
+  novelViewerForward.disabled = !status.canGoForward || status.loading;
+  novelViewerExternal.disabled = !status.committedUrl;
+  novelViewerReload.disabled = !status.loading && !status.committedUrl && !status.lastReadableUrl;
+  novelViewerReload.textContent = status.loading ? "×" : "↻";
+  novelViewerPane.dataset.lifecycle = status.lifecycle;
+  novelViewerPane.title = status.title ?? "Novel Viewer";
+  if (!novelViewerAddressDirty) {
+    // The address bar shows the authoritative committed location. A pending URL
+    // is only a fallback before the first main-frame commit; drafts stay separate.
+    novelViewerAddress.value = status.committedUrl ?? status.pendingUrl ?? status.lastReadableUrl ?? "";
+  }
+  novelViewerLocalState.classList.toggle("is-error", Boolean(status.error));
+  novelViewerLocalState.textContent = status.error?.message
+    ?? (status.loading && !status.committedUrl ? novelViewerText().loading : !status.committedUrl ? novelViewerText().empty : "");
+  applyNovelViewerLabels();
+  scheduleNovelViewerBounds();
+  reportUnexpectedPlaceholderIfNeeded();
+}
+
+function scheduleNovelViewerBounds(): void {
+  if (novelViewerBoundsFrame !== null) return;
+  novelViewerBoundsFrame = window.requestAnimationFrame(() => {
+    novelViewerBoundsFrame = null;
+    const rect = novelViewerSlot.getBoundingClientRect();
+    novelViewerLayoutRevision += 1;
+    const visible = Boolean(
+      novelViewerOpen &&
+      rect.width > 0 &&
+      rect.height > 0
+    );
+    void window.textEditor.updateNovelViewerBounds({
+      layoutRevision: novelViewerLayoutRevision,
+      x: Math.max(0, rect.x),
+      y: Math.max(0, rect.y),
+      width: Math.max(0, rect.width),
+      height: Math.max(0, rect.height),
+      visible
+    }).catch((error: unknown) => console.error("Failed to update Novel Viewer bounds:", error));
+  });
+}
+
+function isRenderedOccluder(element: Element | null): boolean {
+  if (!(element instanceof HTMLElement) || element.hidden || element.getClientRects().length === 0) return false;
+  const style = window.getComputedStyle(element);
+  return style.display !== "none" && style.visibility !== "hidden";
+}
+
+function currentNovelViewerOcclusionReasons(): Set<NovelViewerOcclusionReason> {
+  const reasons = new Set<NovelViewerOcclusionReason>();
+  const overlays = Array.from(document.querySelectorAll(".dialog-overlay")).filter(isRenderedOccluder);
+  if (overlays.some((overlay) => overlay.matches(".command-palette, .command-palette-overlay"))) {
+    reasons.add("command-palette");
+  }
+  if (overlays.some((overlay) => !overlay.matches(".command-palette, .command-palette-overlay"))) {
+    reasons.add("dialog");
+  }
+  if (Array.from(document.querySelectorAll(".context-menu")).some(isRenderedOccluder)) reasons.add("context-menu");
+  if (Array.from(document.querySelectorAll(".cm-panel.cm-search")).some(isRenderedOccluder)) reasons.add("editor-search");
+  if (!searchPanel.hidden && isRenderedOccluder(searchPanel)) reasons.add("global-search");
+  if (workspaceImportInProgress || workspaceImportedNeedsRestart) reasons.add("workspace-import");
+  return reasons;
+}
+
+function sameOcclusionReasons(
+  left: ReadonlySet<NovelViewerOcclusionReason>,
+  right: ReadonlySet<NovelViewerOcclusionReason>
+): boolean {
+  return left.size === right.size && [...left].every((reason) => right.has(reason));
+}
+
+function syncNovelViewerOcclusion(force = false): void {
+  const reasons = currentNovelViewerOcclusionReasons();
+  if (!force && sameOcclusionReasons(reasons, novelViewerOcclusionReasons)) return;
+  novelViewerOcclusionReasons = reasons;
+  novelViewerOcclusionRevision += 1;
+  void window.textEditor.setNovelViewerOcclusion({
+    revision: novelViewerOcclusionRevision,
+    reasons: [...reasons]
+  }).catch((error: unknown) =>
+    console.error("Failed to update Novel Viewer occlusion:", error)
+  );
+  scheduleNovelViewerBounds();
+}
+
+function rendererElementDiagnostic(element: HTMLElement): NovelViewerRendererDiagnosticSnapshot["pane"] {
+  const rect = element.getBoundingClientRect();
+  const style = window.getComputedStyle(element);
+  return {
+    isConnected: element.isConnected,
+    rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
+    offsetWidth: element.offsetWidth,
+    offsetHeight: element.offsetHeight,
+    display: style.display,
+    visibility: style.visibility
+  };
+}
+
+function captureNovelViewerRendererDiagnostic(): NovelViewerRendererDiagnosticSnapshot {
+  const placeholderText = (novelViewerLocalState.textContent ?? "").trim().slice(0, 500);
+  const occlusionReasons = [...currentNovelViewerOcclusionReasons()];
+  const nativeViewExpected = Boolean(
+    novelViewerOpen &&
+    novelViewerStatus.committedUrl &&
+    !novelViewerStatus.error &&
+    occlusionReasons.length === 0
+  );
+  return {
+    pane: rendererElementDiagnostic(novelViewerPane),
+    slot: rendererElementDiagnostic(novelViewerSlot),
+    open: novelViewerOpen,
+    narrowFallback: novelViewerSinglePane,
+    splitMode: workspace.layout.splitMode,
+    occlusionReasons,
+    layoutRevision: novelViewerLayoutRevision,
+    nativeViewExpected,
+    placeholderVisible: Boolean(placeholderText && isRenderedOccluder(novelViewerLocalState)),
+    placeholderText,
+    title: (novelViewerStatus.title ?? "").slice(0, 300),
+    url: (novelViewerStatus.committedUrl ?? novelViewerStatus.pendingUrl ?? novelViewerStatus.lastReadableUrl ?? "").slice(0, 4096),
+    lifecycle: novelViewerStatus.lifecycle
+  };
+}
+
+function submitNovelViewerRendererDiagnostic(reason: string): void {
+  void window.textEditor.submitNovelViewerDiagnosticSnapshot(
+    reason.slice(0, 120),
+    captureNovelViewerRendererDiagnostic()
+  ).catch((error: unknown) => console.error("Failed to submit Novel Viewer renderer diagnostics:", error));
+}
+
+function reportUnexpectedPlaceholderIfNeeded(): void {
+  const snapshot = captureNovelViewerRendererDiagnostic();
+  if (!snapshot.nativeViewExpected || !snapshot.placeholderVisible) {
+    lastPlaceholderDiagnosticSignature = "";
+    return;
+  }
+  const signature = `${snapshot.url}|${snapshot.title}|${snapshot.layoutRevision}|${snapshot.placeholderText}`;
+  if (signature === lastPlaceholderDiagnosticSignature) return;
+  lastPlaceholderDiagnosticSignature = signature;
+  void window.textEditor.submitNovelViewerDiagnosticSnapshot("placeholder-visible-while-native-expected", snapshot)
+    .catch((error: unknown) => console.error("Failed to submit Novel Viewer placeholder diagnostics:", error));
+}
+
+function applyNovelViewerLayout(): void {
+  if (!novelViewerOpen) return;
+  const availableWidth = editorSplit.getBoundingClientRect().width;
+  novelViewerSinglePane = availableWidth < SPLIT_PANE_MIN_WIDTH * 2 + SPLIT_RESIZER_WIDTH;
+  editorArea.classList.add("is-split", "has-novel-viewer");
+  editorArea.classList.toggle("is-novel-viewer-single", novelViewerSinglePane);
+  novelViewerPane.hidden = false;
+  rightPaneElement.hidden = true;
+  leftPaneElement.hidden = novelViewerSinglePane;
+  splitResizer.hidden = novelViewerSinglePane;
+  applySplitColumns(!novelViewerSinglePane);
+  scheduleNovelViewerBounds();
+}
+
+async function openNovelViewer(): Promise<void> {
+  if (novelViewerOpen) {
+    novelViewerAddress.focus();
+    novelViewerAddress.select();
+    return;
+  }
+  novelViewerOpen = true;
+  applyEditorLayout();
+  syncNovelViewerOcclusion(true);
+  renderNovelViewerStatus(await window.textEditor.openNovelViewer());
+}
+
+async function closeNovelViewer(): Promise<void> {
+  if (!novelViewerOpen) return;
+  novelViewerOpen = false;
+  novelViewerAddressDirty = false;
+  applyEditorLayout();
+  activePane().view?.focus();
+  renderNovelViewerStatus(await window.textEditor.closeNovelViewer());
+}
+
+async function toggleNovelViewer(): Promise<void> {
+  if (novelViewerOpen) await closeNovelViewer();
+  else await openNovelViewer();
+}
+
+function focusNovelViewerAddress(): void {
+  if (!novelViewerOpen) {
+    void openNovelViewer().then(() => {
+      novelViewerAddress.focus();
+      novelViewerAddress.select();
+    });
+    return;
+  }
+  novelViewerAddress.focus();
+  novelViewerAddress.select();
+}
+
+function setupNovelViewerLayoutObservers(): void {
+  const resizeObserver = new ResizeObserver(() => {
+    if (novelViewerOpen) {
+      applyNovelViewerLayout();
+      applySidebarWidth();
+    }
+  });
+  resizeObserver.observe(editorSplit);
+  resizeObserver.observe(novelViewerSlot);
+  const mutationObserver = new MutationObserver(() => syncNovelViewerOcclusion());
+  mutationObserver.observe(document.body, {
+    childList: true,
+    subtree: true,
+    attributes: true,
+    attributeFilter: ["hidden", "class", "style", "aria-hidden"]
+  });
+}
+
 function normalizedSplitRatio(): number {
   const savedRatio = Number.isFinite(workspace.layout.splitRatio) ? workspace.layout.splitRatio : 0.5;
   return Math.min(0.8, Math.max(0.2, savedRatio));
@@ -1504,7 +1810,7 @@ function clampSplitRatioForWidth(ratio: number, totalWidth: number): number {
   return Math.min(1 - minimumRatio, Math.max(minimumRatio, ratio));
 }
 
-function applySplitColumns(split = workspace.layout.splitMode === "vertical"): void {
+function applySplitColumns(split = novelViewerOpen ? !novelViewerSinglePane : workspace.layout.splitMode === "vertical"): void {
   if (!split) {
     editorSplit.style.gridTemplateColumns = "minmax(0, 1fr) 0 0";
     return;
@@ -1515,10 +1821,19 @@ function applySplitColumns(split = workspace.layout.splitMode === "vertical"): v
 
 function applyEditorLayout(): void {
   const split = workspace.layout.splitMode === "vertical";
-  editorArea.classList.toggle("is-split", split);
-  rightPaneElement.hidden = !split;
-  splitResizer.hidden = !split;
+  editorArea.classList.toggle("is-split", split || novelViewerOpen);
+  editorArea.classList.toggle("has-novel-viewer", novelViewerOpen);
+  editorArea.classList.remove("is-novel-viewer-single");
+  novelViewerPane.hidden = !novelViewerOpen;
+  leftPaneElement.hidden = false;
+  rightPaneElement.hidden = novelViewerOpen || !split;
+  splitResizer.hidden = novelViewerOpen || !split;
   applySidebarWidth();
+  if (novelViewerOpen) {
+    applyNovelViewerLayout();
+    updatePaneTitles();
+    return;
+  }
   if (!split && activePaneId === "right") {
     setActivePane("left");
   } else {
@@ -2573,7 +2888,10 @@ async function applyTabTitle(id: string, title: string): Promise<void> {
     return;
   }
 
-  const tab = await loadTabToCache(id);
+  // Keep the title mutation synchronous when the active document is already cached.
+  // Otherwise a following editor transaction can start a save with the old title
+  // while this function is suspended at an already-resolved Promise.
+  const tab = contentCache.get(id) ?? await loadTabToCache(id);
   tab.title = nextTitle;
   tab.updatedAt = nowIso();
   contentCache.set(id, tab);
@@ -3315,6 +3633,7 @@ function applyLocale(): void {
   leftEditorHost.dataset.emptyLabel = text().noOpenTab;
   rightEditorHost.dataset.emptyLabel = text().noOpenTab;
   updateGlobalSearchLabels();
+  applyNovelViewerLabels();
 }
 
 function clearRestoredWorkspaceViewState(): void {
@@ -3384,6 +3703,10 @@ async function closeSplit(): Promise<void> {
 }
 
 function focusEditorPane(id: PaneId): void {
+  if (id === "right" && novelViewerOpen) {
+    void window.textEditor.focusNovelViewerRemote();
+    return;
+  }
   if (id === "right" && workspace.layout.splitMode !== "vertical") {
     return;
   }
@@ -3397,7 +3720,7 @@ function applySidebarWidth(): void {
   const narrowSearch = !searchPanel.hidden && window.innerWidth < 980;
   const sidebarWidth = narrowSearch ? 0 : width;
   const searchWidth = searchPanel.hidden ? 0 : narrowSearch ? Math.min(320, Math.max(240, Math.floor(window.innerWidth * 0.38))) : 300;
-  const splitAllowsMinimap = workspace.layout.splitMode !== "vertical" || window.innerWidth >= 1350;
+  const splitAllowsMinimap = !novelViewerOpen && (workspace.layout.splitMode !== "vertical" || window.innerWidth >= 1350);
   const minimapVisible = splitAllowsMinimap && window.innerWidth >= 1050 && (searchPanel.hidden || window.innerWidth >= 1350);
   workspaceElement.classList.toggle("is-search-narrow", narrowSearch);
   workspaceElement.classList.toggle("is-minimap-hidden", !minimapVisible);
@@ -3409,7 +3732,7 @@ function setupSplitResize(): void {
   let resizing = false;
 
   splitResizer.addEventListener("pointerdown", (event) => {
-    if (workspace.layout.splitMode !== "vertical") {
+    if (novelViewerOpen || workspace.layout.splitMode !== "vertical") {
       return;
     }
     resizing = true;
@@ -3514,7 +3837,18 @@ async function performAction(
   else if (action === "close-split") await closeSplit();
   else if (action === "focus-left") focusEditorPane("left");
   else if (action === "focus-right") focusEditorPane("right");
-  else if (action === "reload-app") await window.textEditor.reloadApp();
+  else if (action === "toggle-novel-viewer") await toggleNovelViewer();
+  else if (action === "focus-novel-viewer-address") focusNovelViewerAddress();
+  else if (action === "close-novel-viewer") await closeNovelViewer();
+  else if (action === "novel-viewer-back") renderNovelViewerStatus(await window.textEditor.goBackNovelViewer());
+  else if (action === "novel-viewer-forward") renderNovelViewerStatus(await window.textEditor.goForwardNovelViewer());
+  else if (action === "novel-viewer-reload") renderNovelViewerStatus(await window.textEditor.reloadOrStopNovelViewer());
+  else if (action === "novel-viewer-external") await window.textEditor.openNovelViewerExternal();
+  else if (action === "novel-viewer-close") await closeNovelViewer();
+  else if (action === "reload-app") {
+    if (novelViewerOpen) renderNovelViewerStatus(await window.textEditor.reloadOrStopNovelViewer());
+    else await window.textEditor.reloadApp();
+  }
   else if (action === "undo" || action === "redo" || action === "find" || action === "replace" || action === "find-next" || action === "find-previous") {
     runEditorCommand(action);
   } else if (action === "toggle-theme") {
@@ -3780,6 +4114,9 @@ document.addEventListener("keydown", (event) => {
     "mod+shift+c": "copy-all",
     "mod+shift+l": "toggle-locale",
     "mod+shift+f": "global-search",
+    "mod+shift+v": "toggle-novel-viewer",
+    "mod+shift+w": "close-novel-viewer",
+    "mod+l": "focus-novel-viewer-address",
     "mod+\\": "split-right",
     "mod+1": "focus-left",
     "mod+2": "focus-right",
@@ -3821,7 +4158,29 @@ document.addEventListener("keydown", (event) => {
       activeTitleInput.value = titleBeforeEdit;
       activeTitleInput.blur();
     }
+    if (novelViewerOpen && !overlay && document.activeElement === novelViewerAddress) {
+      if (!novelViewerSinglePane) panes.left.view?.focus();
+      else novelViewerAddress.blur();
+    }
   }
+});
+
+novelViewerAddress.addEventListener("input", () => {
+  novelViewerAddressDirty = true;
+});
+
+novelViewerAddressForm.addEventListener("submit", (event) => {
+  event.preventDefault();
+  const requestedUrl = novelViewerAddress.value;
+  novelViewerAddressDirty = false;
+  void window.textEditor.navigateNovelViewer(requestedUrl).then(renderNovelViewerStatus, (error: unknown) => {
+    console.error("Novel Viewer navigation failed:", error);
+  });
+});
+
+novelViewerSlot.addEventListener("focus", () => {
+  if (novelViewerStatus.committedUrl && !novelViewerStatus.error) void window.textEditor.focusNovelViewerRemote();
+  else focusNovelViewerAddress();
 });
 
 activeTitleInput.addEventListener("focus", () => {
@@ -3863,6 +4222,7 @@ document.querySelectorAll<HTMLInputElement>(".pane-title-input").forEach((input)
 
 window.addEventListener("resize", () => {
   applySidebarWidth();
+  if (novelViewerOpen) applyNovelViewerLayout();
 });
 
 window.textEditor.onMenuAction((action: MenuAction) => {
@@ -3874,6 +4234,25 @@ window.textEditor.onMenuAction((action: MenuAction) => {
       console.error(error);
     }
   })();
+});
+
+window.textEditor.onNovelViewerState((status) => {
+  renderNovelViewerStatus(status);
+});
+
+window.textEditor.onNovelViewerFocusAddress(() => focusNovelViewerAddress());
+window.textEditor.onNovelViewerRequestClose(() => {
+  void closeNovelViewer();
+});
+window.textEditor.onNovelViewerScrollRestoreWarning(() => {
+  setSaveState(novelViewerText().restoreWarning, "error");
+});
+window.textEditor.onNovelViewerRequestBounds(() => {
+  syncNovelViewerOcclusion(true);
+  scheduleNovelViewerBounds();
+});
+window.textEditor.onNovelViewerRequestDiagnosticSnapshot((reason) => {
+  submitNovelViewerRendererDiagnostic(reason);
 });
 
 window.addEventListener("texteditor:workspace-imported", () => {
@@ -4102,11 +4481,13 @@ function finishBootstrap(focusNewTitle = false): void {
 async function bootstrap(): Promise<void> {
   let completed = false;
   let focusNewTitle = false;
+  let restoreNovelViewer = true;
   try {
     createEditor(panes.left);
     createEditor(panes.right);
     setupSidebarResize();
     setupSplitResize();
+    setupNovelViewerLayoutObservers();
     const snapshot = await window.textEditor.loadApp();
     workspace = snapshot.workspace;
     tabIndex = normalizeTabsIndex(snapshot.tabIndex);
@@ -4122,6 +4503,7 @@ async function bootstrap(): Promise<void> {
       return;
     }
     await window.textEditor.acknowledgeRecovery(choice === "restore");
+    restoreNovelViewer = choice === "restore";
     if (choice === "skip") {
       clearRestoredWorkspaceViewState();
       await saveWorkspace();
@@ -4138,6 +4520,11 @@ async function bootstrap(): Promise<void> {
   panes.right.activeChildTabId = savedRightPane?.activeChildTabId ?? MAIN_CHILD_TAB_ID;
   syncActiveTabId();
   applyEditorLayout();
+  const novelViewerStartup = await window.textEditor.initializeNovelViewer(restoreNovelViewer);
+  renderNovelViewerStatus(novelViewerStartup.status);
+  if (novelViewerStartup.shouldRestore) {
+    await openNovelViewer();
+  }
   startBackupTimer();
   (Object.values(panes) as EditorPaneState[]).forEach((pane) => {
     pane.view?.dispatch({
