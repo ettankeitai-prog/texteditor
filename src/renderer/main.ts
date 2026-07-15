@@ -28,10 +28,22 @@ import {
   normalizeTabDocument,
   normalizeTabsIndex
 } from "../shared/schema";
-import type {
-  NovelViewerOcclusionReason,
-  NovelViewerRendererDiagnosticSnapshot,
-  NovelViewerStatus
+import {
+  NOVEL_VIEWER_EDITOR_MIN_WIDTH,
+  NOVEL_VIEWER_PANE_MIN_WIDTH,
+  NOVEL_VIEWER_SPLIT_RATIO_DEFAULT,
+  NOVEL_VIEWER_SPLIT_RATIO_MAX,
+  NOVEL_VIEWER_SPLIT_RATIO_MIN,
+  NOVEL_VIEWER_TOC_REMOTE_MIN_WIDTH,
+  NOVEL_VIEWER_TOC_RESIZER_WIDTH,
+  NOVEL_VIEWER_TOC_WIDTH_DEFAULT,
+  NOVEL_VIEWER_TOC_WIDTH_MAX,
+  NOVEL_VIEWER_TOC_WIDTH_MIN,
+  type NovelViewerUiLayoutUpdate,
+  type NovelViewerOcclusionReason,
+  type NovelViewerRendererDiagnosticSnapshot,
+  type NovelViewerStatus,
+  type NovelViewerTocState
 } from "../shared/novelViewer";
 
 type MenuAction =
@@ -104,7 +116,7 @@ app.innerHTML = `
             </div>
             <div class="editor-host" id="left-editor-host" data-testid="active-editor-host"></div>
           </section>
-          <div class="split-resizer" id="split-resizer" hidden></div>
+          <div class="split-resizer" id="split-resizer" role="separator" aria-orientation="vertical" tabindex="-1" hidden></div>
           <section class="editor-pane" data-pane-id="right" hidden>
             <div class="pane-editor-header">
               <input class="pane-editor-title pane-title-input" id="right-pane-title" data-pane-id="right" value="No tab" aria-label="Right editor tab title" disabled />
@@ -117,12 +129,26 @@ app.innerHTML = `
               <button type="button" class="novel-viewer-button" id="novel-viewer-back" data-action="novel-viewer-back" aria-label="Back" title="Back">←</button>
               <button type="button" class="novel-viewer-button" id="novel-viewer-forward" data-action="novel-viewer-forward" aria-label="Forward" title="Forward">→</button>
               <button type="button" class="novel-viewer-button" id="novel-viewer-reload" data-action="novel-viewer-reload" aria-label="Reload" title="Reload">↻</button>
+              <button type="button" class="novel-viewer-button" id="novel-viewer-toc" data-action="novel-viewer-toc-toggle" aria-label="Table of contents" title="Table of contents">☰</button>
               <input class="novel-viewer-address" id="novel-viewer-address" type="text" inputmode="url" autocomplete="off" spellcheck="false" aria-label="Novel Viewer URL" placeholder="https://kakuyomu.jp/…" />
               <button type="button" class="novel-viewer-button" id="novel-viewer-external" data-action="novel-viewer-external" aria-label="Open in external browser" title="Open in external browser">↗</button>
               <button type="button" class="novel-viewer-button" id="novel-viewer-close" data-action="novel-viewer-close" aria-label="Close Novel Viewer" title="Close Novel Viewer">×</button>
             </form>
-            <div class="novel-viewer-slot" id="novel-viewer-slot" tabindex="0">
-              <div class="novel-viewer-local-state" id="novel-viewer-local-state" aria-live="polite"></div>
+            <div class="novel-viewer-content" id="novel-viewer-content">
+              <aside class="novel-viewer-toc-panel" id="novel-viewer-toc-panel" aria-label="Table of contents" hidden>
+                <div class="novel-viewer-toc-header">
+                  <div class="novel-viewer-toc-heading" id="novel-viewer-toc-heading">Table of contents</div>
+                  <button type="button" class="novel-viewer-toc-control" id="novel-viewer-toc-refresh" data-action="novel-viewer-toc-refresh" aria-label="Refresh table of contents" title="Refresh table of contents">↻</button>
+                  <button type="button" class="novel-viewer-toc-control" id="novel-viewer-toc-close" data-action="novel-viewer-toc-close" aria-label="Close table of contents" title="Close table of contents">×</button>
+                </div>
+                <div class="novel-viewer-toc-meta" id="novel-viewer-toc-meta"></div>
+                <div class="novel-viewer-toc-status" id="novel-viewer-toc-status" aria-live="polite"></div>
+                <div class="novel-viewer-toc-list" id="novel-viewer-toc-list"></div>
+              </aside>
+              <div class="novel-viewer-toc-resizer" id="novel-viewer-toc-resizer" role="separator" aria-orientation="vertical" tabindex="0" hidden></div>
+              <div class="novel-viewer-slot" id="novel-viewer-slot" tabindex="0">
+                <div class="novel-viewer-local-state" id="novel-viewer-local-state" aria-live="polite"></div>
+              </div>
             </div>
           </section>
         </div>
@@ -153,6 +179,7 @@ const splitResizer = document.querySelector<HTMLDivElement>("#split-resizer")!;
 const leftPaneElement = document.querySelector<HTMLElement>('[data-pane-id="left"]')!;
 const rightPaneElement = document.querySelector<HTMLElement>('[data-pane-id="right"]')!;
 const novelViewerPane = document.querySelector<HTMLElement>("#novel-viewer-pane")!;
+const novelViewerContent = document.querySelector<HTMLDivElement>("#novel-viewer-content")!;
 const novelViewerSlot = document.querySelector<HTMLDivElement>("#novel-viewer-slot")!;
 const novelViewerLocalState = document.querySelector<HTMLDivElement>("#novel-viewer-local-state")!;
 const novelViewerAddressForm = document.querySelector<HTMLFormElement>("#novel-viewer-address-form")!;
@@ -160,8 +187,17 @@ const novelViewerAddress = document.querySelector<HTMLInputElement>("#novel-view
 const novelViewerBack = document.querySelector<HTMLButtonElement>("#novel-viewer-back")!;
 const novelViewerForward = document.querySelector<HTMLButtonElement>("#novel-viewer-forward")!;
 const novelViewerReload = document.querySelector<HTMLButtonElement>("#novel-viewer-reload")!;
+const novelViewerToc = document.querySelector<HTMLButtonElement>("#novel-viewer-toc")!;
 const novelViewerExternal = document.querySelector<HTMLButtonElement>("#novel-viewer-external")!;
 const novelViewerClose = document.querySelector<HTMLButtonElement>("#novel-viewer-close")!;
+const novelViewerTocPanel = document.querySelector<HTMLElement>("#novel-viewer-toc-panel")!;
+const novelViewerTocResizer = document.querySelector<HTMLDivElement>("#novel-viewer-toc-resizer")!;
+const novelViewerTocHeading = document.querySelector<HTMLDivElement>("#novel-viewer-toc-heading")!;
+const novelViewerTocMeta = document.querySelector<HTMLDivElement>("#novel-viewer-toc-meta")!;
+const novelViewerTocStatusElement = document.querySelector<HTMLDivElement>("#novel-viewer-toc-status")!;
+const novelViewerTocList = document.querySelector<HTMLDivElement>("#novel-viewer-toc-list")!;
+const novelViewerTocRefresh = document.querySelector<HTMLButtonElement>("#novel-viewer-toc-refresh")!;
+const novelViewerTocClose = document.querySelector<HTMLButtonElement>("#novel-viewer-toc-close")!;
 const leftEditorHost = document.querySelector<HTMLDivElement>("#left-editor-host")!;
 const rightEditorHost = document.querySelector<HTMLDivElement>("#right-editor-host")!;
 const leftPaneTitle = document.querySelector<HTMLInputElement>("#left-pane-title")!;
@@ -205,6 +241,23 @@ let novelViewerLayoutRevision = 0;
 let novelViewerBoundsFrame: number | null = null;
 let novelViewerOcclusionRevision = 0;
 let novelViewerOcclusionReasons = new Set<NovelViewerOcclusionReason>();
+let novelViewerTocOpen = false;
+let novelViewerTocNarrow = false;
+let novelViewerTocWidthPx = NOVEL_VIEWER_TOC_WIDTH_DEFAULT;
+let novelViewerSplitRatio = NOVEL_VIEWER_SPLIT_RATIO_DEFAULT;
+let novelViewerTocResizing = false;
+let novelViewerMainSplitResizing = false;
+let novelViewerTocWidthSavePending = false;
+let novelViewerSplitRatioSavePending = false;
+let novelViewerTocState: NovelViewerTocState = {
+  status: "closed",
+  panelOpen: false,
+  supported: false,
+  sections: [],
+  cached: false,
+  stale: false,
+  canRefresh: false
+};
 let lastPlaceholderDiagnosticSignature = "";
 let novelViewerStatus: NovelViewerStatus = {
   lifecycle: "closed",
@@ -1547,6 +1600,19 @@ function novelViewerText() {
         stop: "停止",
         external: "外部ブラウザで開く",
         close: "Novel Viewerを閉じる",
+        toc: "目次",
+        tocRefresh: "目次を更新",
+        tocClose: "目次を閉じる",
+        tocResize: "目次パネルの幅を変更",
+        mainSplitResize: "EditorとNovel Viewerの幅を変更",
+        editorSplitResize: "Editorペインの幅を変更",
+        tocLoading: "目次を取得しています…",
+        tocUnsupported: "このページでは目次を利用できません。",
+        tocError: "目次を取得できませんでした。",
+        tocStale: "保存済みの目次を表示しています。",
+        tocUpdated: "最終更新",
+        tocSiteKakuyomu: "カクヨム",
+        tocSiteNarou: "小説家になろう",
         address: "Novel Viewer URL",
         empty: "カクヨムまたは小説家になろうの公開作品URLを入力してください。",
         loading: "ページを読み込んでいます…",
@@ -1559,6 +1625,19 @@ function novelViewerText() {
         stop: "Stop",
         external: "Open in external browser",
         close: "Close Novel Viewer",
+        toc: "Table of contents",
+        tocRefresh: "Refresh table of contents",
+        tocClose: "Close table of contents",
+        tocResize: "Resize table of contents",
+        mainSplitResize: "Resize Editor and Novel Viewer",
+        editorSplitResize: "Resize Editor panes",
+        tocLoading: "Loading table of contents…",
+        tocUnsupported: "A table of contents is not available for this page.",
+        tocError: "The table of contents could not be loaded.",
+        tocStale: "Showing a saved table of contents.",
+        tocUpdated: "Updated",
+        tocSiteKakuyomu: "Kakuyomu",
+        tocSiteNarou: "Shōsetsuka ni Narō",
         address: "Novel Viewer URL",
         empty: "Enter a public Kakuyomu or Shōsetsuka ni Narō URL.",
         loading: "Loading page…",
@@ -1572,22 +1651,155 @@ function applyNovelViewerLabels(): void {
     [novelViewerBack, label.back],
     [novelViewerForward, label.forward],
     [novelViewerReload, novelViewerStatus.loading ? label.stop : label.reload],
+    [novelViewerToc, label.toc],
     [novelViewerExternal, label.external],
-    [novelViewerClose, label.close]
+    [novelViewerClose, label.close],
+    [novelViewerTocRefresh, label.tocRefresh],
+    [novelViewerTocClose, label.tocClose]
   ];
   controls.forEach(([control, value]) => {
     control.setAttribute("aria-label", value);
     control.setAttribute("title", value);
   });
   novelViewerAddress.setAttribute("aria-label", label.address);
+  novelViewerTocResizer.setAttribute("aria-label", label.tocResize);
+  novelViewerTocResizer.setAttribute("title", label.tocResize);
+  if (novelViewerOpen) {
+    splitResizer.setAttribute("aria-label", label.mainSplitResize);
+    splitResizer.setAttribute("title", label.mainSplitResize);
+  } else {
+    splitResizer.setAttribute("aria-label", label.editorSplitResize);
+    splitResizer.setAttribute("title", label.editorSplitResize);
+  }
+  novelViewerTocHeading.textContent = label.toc;
+}
+
+function renderNovelViewerTocState(state = novelViewerTocState): void {
+  novelViewerTocState = state;
+  novelViewerTocOpen = state.panelOpen;
+  novelViewerToc.disabled = !novelViewerOpen || !state.supported;
+  novelViewerToc.classList.toggle("is-active", novelViewerTocOpen);
+  novelViewerTocPanel.hidden = !novelViewerTocOpen;
+  novelViewerTocRefresh.disabled = !state.canRefresh || state.status === "loading";
+  const label = novelViewerText();
+  novelViewerTocMeta.replaceChildren();
+  if (state.workTitle) {
+    const workTitle = document.createElement("div");
+    workTitle.className = "novel-viewer-toc-work-title";
+    workTitle.textContent = state.workTitle;
+    novelViewerTocMeta.append(workTitle);
+  }
+  if (state.adapterId || state.fetchedAt) {
+    const detail = document.createElement("div");
+    detail.className = "novel-viewer-toc-detail";
+    const site = state.adapterId === "kakuyomu"
+      ? label.tocSiteKakuyomu
+      : state.adapterId === "narou" ? label.tocSiteNarou : "";
+    const fetchedAt = state.fetchedAt && Number.isFinite(Date.parse(state.fetchedAt))
+      ? `${label.tocUpdated}: ${new Date(state.fetchedAt).toLocaleString(workspace.locale === "jp" ? "ja-JP" : "en-US")}`
+      : "";
+    detail.textContent = [site, fetchedAt].filter(Boolean).join(" · ");
+    novelViewerTocMeta.append(detail);
+  }
+  novelViewerTocStatusElement.className = "novel-viewer-toc-status";
+  novelViewerTocStatusElement.textContent = state.status === "loading"
+    ? label.tocLoading
+    : state.status === "unsupported"
+      ? label.tocUnsupported
+      : state.status === "error"
+        ? state.error?.message ?? label.tocError
+        : state.stale
+          ? state.error?.message ?? label.tocStale
+          : "";
+  novelViewerTocStatusElement.classList.toggle("is-error", state.status === "error" || Boolean(state.error));
+  novelViewerTocStatusElement.hidden = !novelViewerTocStatusElement.textContent;
+  novelViewerTocList.replaceChildren();
+  for (const section of state.sections) {
+    const sectionElement = document.createElement("section");
+    sectionElement.className = "novel-viewer-toc-section";
+    if (section.title) {
+      const heading = document.createElement("h3");
+      heading.className = "novel-viewer-toc-section-title";
+      heading.textContent = section.title;
+      sectionElement.append(heading);
+    }
+    for (const episode of section.episodes) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "novel-viewer-toc-episode";
+      button.dataset.action = "novel-viewer-toc-episode";
+      button.dataset.adapterId = state.adapterId ?? "";
+      button.dataset.workId = state.workId ?? "";
+      button.dataset.episodeId = episode.episodeId;
+      button.textContent = episode.title;
+      button.title = episode.title;
+      if (episode.episodeId === state.currentEpisodeId) {
+        button.classList.add("is-current");
+        button.setAttribute("aria-current", "page");
+      }
+      sectionElement.append(button);
+    }
+    novelViewerTocList.append(sectionElement);
+  }
+  applyNovelViewerTocLayout();
+  if (novelViewerTocOpen && state.currentEpisodeId) {
+    window.requestAnimationFrame(() => {
+      novelViewerTocList.querySelector<HTMLElement>('.novel-viewer-toc-episode[aria-current="page"]')
+        ?.scrollIntoView({ block: "nearest" });
+    });
+  }
+  applyNovelViewerLabels();
+}
+
+function applyNovelViewerTocLayout(): void {
+  const availableWidth = novelViewerContent.getBoundingClientRect().width;
+  novelViewerTocWidthPx = Math.min(
+    NOVEL_VIEWER_TOC_WIDTH_MAX,
+    Math.max(NOVEL_VIEWER_TOC_WIDTH_MIN, novelViewerTocWidthPx)
+  );
+  novelViewerContent.style.setProperty("--novel-viewer-toc-width", `${novelViewerTocWidthPx}px`);
+  novelViewerContent.style.setProperty("--novel-viewer-toc-resizer-width", `${NOVEL_VIEWER_TOC_RESIZER_WIDTH}px`);
+  novelViewerContent.style.setProperty("--novel-viewer-remote-min-width", `${NOVEL_VIEWER_TOC_REMOTE_MIN_WIDTH}px`);
+  novelViewerTocNarrow = Boolean(
+    novelViewerTocOpen &&
+    availableWidth < novelViewerTocWidthPx + NOVEL_VIEWER_TOC_RESIZER_WIDTH + NOVEL_VIEWER_TOC_REMOTE_MIN_WIDTH
+  );
+  novelViewerContent.classList.toggle("has-toc", novelViewerTocOpen);
+  novelViewerContent.classList.toggle("is-toc-wide", novelViewerTocOpen && !novelViewerTocNarrow);
+  novelViewerContent.classList.toggle("is-toc-narrow", novelViewerTocNarrow);
+  novelViewerTocResizer.hidden = !novelViewerTocOpen || novelViewerTocNarrow;
+  novelViewerTocResizer.setAttribute("aria-valuemin", String(NOVEL_VIEWER_TOC_WIDTH_MIN));
+  novelViewerTocResizer.setAttribute("aria-valuemax", String(NOVEL_VIEWER_TOC_WIDTH_MAX));
+  novelViewerTocResizer.setAttribute("aria-valuenow", String(Math.round(novelViewerTocWidthPx)));
+  syncNovelViewerOcclusion();
+  scheduleNovelViewerBounds();
 }
 
 function renderNovelViewerStatus(status = novelViewerStatus): void {
   novelViewerStatus = status;
+  if (
+    !novelViewerTocResizing && !novelViewerTocWidthSavePending &&
+    typeof status.tocWidthPx === "number" && Number.isFinite(status.tocWidthPx)
+  ) {
+    novelViewerTocWidthPx = Math.min(
+      NOVEL_VIEWER_TOC_WIDTH_MAX,
+      Math.max(NOVEL_VIEWER_TOC_WIDTH_MIN, status.tocWidthPx)
+    );
+  }
+  if (
+    !novelViewerMainSplitResizing && !novelViewerSplitRatioSavePending &&
+    typeof status.novelViewerSplitRatio === "number" && Number.isFinite(status.novelViewerSplitRatio)
+  ) {
+    novelViewerSplitRatio = Math.min(
+      NOVEL_VIEWER_SPLIT_RATIO_MAX,
+      Math.max(NOVEL_VIEWER_SPLIT_RATIO_MIN, status.novelViewerSplitRatio)
+    );
+  }
   novelViewerBack.disabled = !status.canGoBack || status.loading;
   novelViewerForward.disabled = !status.canGoForward || status.loading;
   novelViewerExternal.disabled = !status.committedUrl;
   novelViewerReload.disabled = !status.loading && !status.committedUrl && !status.lastReadableUrl;
+  novelViewerToc.disabled = !novelViewerOpen || !novelViewerTocState.supported;
   novelViewerReload.textContent = status.loading ? "×" : "↻";
   novelViewerPane.dataset.lifecycle = status.lifecycle;
   novelViewerPane.title = status.title ?? "Novel Viewer";
@@ -1600,6 +1812,10 @@ function renderNovelViewerStatus(status = novelViewerStatus): void {
   novelViewerLocalState.textContent = status.error?.message
     ?? (status.loading && !status.committedUrl ? novelViewerText().loading : !status.committedUrl ? novelViewerText().empty : "");
   applyNovelViewerLabels();
+  if (novelViewerOpen) {
+    applySplitColumns();
+    applyNovelViewerTocLayout();
+  }
   scheduleNovelViewerBounds();
   reportUnexpectedPlaceholderIfNeeded();
 }
@@ -1645,6 +1861,9 @@ function currentNovelViewerOcclusionReasons(): Set<NovelViewerOcclusionReason> {
   if (Array.from(document.querySelectorAll(".cm-panel.cm-search")).some(isRenderedOccluder)) reasons.add("editor-search");
   if (!searchPanel.hidden && isRenderedOccluder(searchPanel)) reasons.add("global-search");
   if (workspaceImportInProgress || workspaceImportedNeedsRestart) reasons.add("workspace-import");
+  if (novelViewerTocOpen && novelViewerTocNarrow) reasons.add("toc-panel-narrow");
+  if (novelViewerTocResizing) reasons.add("toc-resize");
+  if (novelViewerMainSplitResizing) reasons.add("main-split-resize");
   return reasons;
 }
 
@@ -1731,14 +1950,18 @@ function reportUnexpectedPlaceholderIfNeeded(): void {
 function applyNovelViewerLayout(): void {
   if (!novelViewerOpen) return;
   const availableWidth = editorSplit.getBoundingClientRect().width;
-  novelViewerSinglePane = availableWidth < SPLIT_PANE_MIN_WIDTH * 2 + SPLIT_RESIZER_WIDTH;
+  novelViewerSinglePane = availableWidth <
+    NOVEL_VIEWER_EDITOR_MIN_WIDTH + NOVEL_VIEWER_PANE_MIN_WIDTH + SPLIT_RESIZER_WIDTH;
   editorArea.classList.add("is-split", "has-novel-viewer");
   editorArea.classList.toggle("is-novel-viewer-single", novelViewerSinglePane);
   novelViewerPane.hidden = false;
   rightPaneElement.hidden = true;
   leftPaneElement.hidden = novelViewerSinglePane;
   splitResizer.hidden = novelViewerSinglePane;
+  splitResizer.tabIndex = novelViewerSinglePane ? -1 : 0;
+  splitResizer.classList.toggle("is-novel-viewer-resizer", !novelViewerSinglePane);
   applySplitColumns(!novelViewerSinglePane);
+  applyNovelViewerTocLayout();
   scheduleNovelViewerBounds();
 }
 
@@ -1757,10 +1980,57 @@ async function openNovelViewer(): Promise<void> {
 async function closeNovelViewer(): Promise<void> {
   if (!novelViewerOpen) return;
   novelViewerOpen = false;
+  novelViewerTocOpen = false;
+  novelViewerTocNarrow = false;
+  renderNovelViewerTocState({
+    status: "closed",
+    panelOpen: false,
+    supported: false,
+    sections: [],
+    cached: false,
+    stale: false,
+    canRefresh: false
+  });
   novelViewerAddressDirty = false;
   applyEditorLayout();
   activePane().view?.focus();
   renderNovelViewerStatus(await window.textEditor.closeNovelViewer());
+}
+
+async function openNovelViewerToc(): Promise<void> {
+  if (!novelViewerOpen || !novelViewerTocState.supported || novelViewerTocOpen) return;
+  novelViewerTocOpen = true;
+  novelViewerTocPanel.hidden = false;
+  applyNovelViewerTocLayout();
+  renderNovelViewerTocState(await window.textEditor.openNovelViewerToc());
+}
+
+async function closeNovelViewerToc(): Promise<void> {
+  if (!novelViewerTocOpen) return;
+  novelViewerTocOpen = false;
+  novelViewerTocNarrow = false;
+  novelViewerTocPanel.hidden = true;
+  applyNovelViewerTocLayout();
+  renderNovelViewerTocState(await window.textEditor.closeNovelViewerToc());
+}
+
+async function toggleNovelViewerToc(): Promise<void> {
+  if (novelViewerTocOpen) await closeNovelViewerToc();
+  else await openNovelViewerToc();
+}
+
+async function refreshNovelViewerToc(): Promise<void> {
+  if (!novelViewerTocOpen || !novelViewerTocState.canRefresh) return;
+  renderNovelViewerTocState(await window.textEditor.refreshNovelViewerToc());
+}
+
+async function selectNovelViewerTocEpisode(source: HTMLElement | undefined): Promise<void> {
+  const adapterId = source?.dataset.adapterId;
+  const workId = source?.dataset.workId;
+  const episodeId = source?.dataset.episodeId;
+  if ((adapterId !== "kakuyomu" && adapterId !== "narou") || !workId || !episodeId) return;
+  if (novelViewerTocNarrow) await closeNovelViewerToc();
+  renderNovelViewerStatus(await window.textEditor.selectNovelViewerTocEpisode({ adapterId, workId, episodeId }));
 }
 
 async function toggleNovelViewer(): Promise<void> {
@@ -1788,6 +2058,7 @@ function setupNovelViewerLayoutObservers(): void {
     }
   });
   resizeObserver.observe(editorSplit);
+  resizeObserver.observe(novelViewerContent);
   resizeObserver.observe(novelViewerSlot);
   const mutationObserver = new MutationObserver(() => syncNovelViewerOcclusion());
   mutationObserver.observe(document.body, {
@@ -1803,6 +2074,13 @@ function normalizedSplitRatio(): number {
   return Math.min(0.8, Math.max(0.2, savedRatio));
 }
 
+function normalizedNovelViewerSplitRatio(): number {
+  return Math.min(
+    NOVEL_VIEWER_SPLIT_RATIO_MAX,
+    Math.max(NOVEL_VIEWER_SPLIT_RATIO_MIN, novelViewerSplitRatio)
+  );
+}
+
 function clampSplitRatioForWidth(ratio: number, totalWidth: number): number {
   const usableWidth = Math.max(1, totalWidth - SPLIT_RESIZER_WIDTH);
   const effectiveMinimumWidth = Math.min(SPLIT_PANE_MIN_WIDTH, usableWidth / 2);
@@ -1810,13 +2088,40 @@ function clampSplitRatioForWidth(ratio: number, totalWidth: number): number {
   return Math.min(1 - minimumRatio, Math.max(minimumRatio, ratio));
 }
 
+function clampNovelViewerSplitRatioForWidth(ratio: number, totalWidth: number): number {
+  const usableWidth = Math.max(1, totalWidth - SPLIT_RESIZER_WIDTH);
+  if (usableWidth < NOVEL_VIEWER_EDITOR_MIN_WIDTH + NOVEL_VIEWER_PANE_MIN_WIDTH) {
+    return normalizedNovelViewerSplitRatio();
+  }
+  const minimumRatio = NOVEL_VIEWER_EDITOR_MIN_WIDTH / usableWidth;
+  const maximumRatio = (usableWidth - NOVEL_VIEWER_PANE_MIN_WIDTH) / usableWidth;
+  return Math.min(maximumRatio, Math.max(minimumRatio, ratio));
+}
+
+function updateSplitResizerAccessibility(displayedRatio: number): void {
+  const usableWidth = Math.max(1, editorSplit.getBoundingClientRect().width - SPLIT_RESIZER_WIDTH);
+  const minimum = novelViewerOpen
+    ? Math.max(NOVEL_VIEWER_SPLIT_RATIO_MIN, NOVEL_VIEWER_EDITOR_MIN_WIDTH / usableWidth)
+    : 0.2;
+  const maximum = novelViewerOpen
+    ? Math.min(NOVEL_VIEWER_SPLIT_RATIO_MAX, (usableWidth - NOVEL_VIEWER_PANE_MIN_WIDTH) / usableWidth)
+    : 0.8;
+  splitResizer.setAttribute("aria-valuemin", String(Math.round(minimum * 100)));
+  splitResizer.setAttribute("aria-valuemax", String(Math.round(maximum * 100)));
+  splitResizer.setAttribute("aria-valuenow", String(Math.round(displayedRatio * 100)));
+}
+
 function applySplitColumns(split = novelViewerOpen ? !novelViewerSinglePane : workspace.layout.splitMode === "vertical"): void {
   if (!split) {
     editorSplit.style.gridTemplateColumns = "minmax(0, 1fr) 0 0";
     return;
   }
-  const displayedRatio = clampSplitRatioForWidth(normalizedSplitRatio(), editorSplit.getBoundingClientRect().width);
+  const totalWidth = editorSplit.getBoundingClientRect().width;
+  const displayedRatio = novelViewerOpen
+    ? clampNovelViewerSplitRatioForWidth(normalizedNovelViewerSplitRatio(), totalWidth)
+    : clampSplitRatioForWidth(normalizedSplitRatio(), totalWidth);
   editorSplit.style.gridTemplateColumns = `minmax(0, ${displayedRatio}fr) ${SPLIT_RESIZER_WIDTH}px minmax(0, ${1 - displayedRatio}fr)`;
+  updateSplitResizerAccessibility(displayedRatio);
 }
 
 function applyEditorLayout(): void {
@@ -1828,6 +2133,8 @@ function applyEditorLayout(): void {
   leftPaneElement.hidden = false;
   rightPaneElement.hidden = novelViewerOpen || !split;
   splitResizer.hidden = novelViewerOpen || !split;
+  splitResizer.tabIndex = -1;
+  splitResizer.classList.remove("is-novel-viewer-resizer");
   applySidebarWidth();
   if (novelViewerOpen) {
     applyNovelViewerLayout();
@@ -3728,44 +4035,207 @@ function applySidebarWidth(): void {
   applySplitColumns();
 }
 
+function persistNovelViewerTocWidth(): void {
+  const tocWidthPx = novelViewerTocWidthPx;
+  novelViewerTocWidthSavePending = true;
+  const update: NovelViewerUiLayoutUpdate = { tocWidthPx };
+  void window.textEditor.updateNovelViewerUiLayout(update).then(
+    (status) => {
+      novelViewerTocWidthSavePending = false;
+      renderNovelViewerStatus(status);
+    },
+    (error: unknown) => {
+      novelViewerTocWidthSavePending = false;
+      console.error("Failed to save Novel Viewer TOC width:", error);
+    }
+  );
+}
+
+function persistNovelViewerSplitRatio(): void {
+  const savedRatio = novelViewerSplitRatio;
+  novelViewerSplitRatioSavePending = true;
+  const update: NovelViewerUiLayoutUpdate = { novelViewerSplitRatio: savedRatio };
+  void window.textEditor.updateNovelViewerUiLayout(update).then(
+    (status) => {
+      novelViewerSplitRatioSavePending = false;
+      renderNovelViewerStatus(status);
+    },
+    (error: unknown) => {
+      novelViewerSplitRatioSavePending = false;
+      console.error("Failed to save Novel Viewer split ratio:", error);
+    }
+  );
+}
+
+function maximumTocWidthForCurrentPane(): number {
+  const availableWidth = novelViewerContent.getBoundingClientRect().width;
+  return Math.min(
+    NOVEL_VIEWER_TOC_WIDTH_MAX,
+    Math.max(
+      NOVEL_VIEWER_TOC_WIDTH_MIN,
+      availableWidth - NOVEL_VIEWER_TOC_RESIZER_WIDTH - NOVEL_VIEWER_TOC_REMOTE_MIN_WIDTH
+    )
+  );
+}
+
+function applyRequestedTocWidth(requestedWidth: number): void {
+  novelViewerTocWidthPx = Math.min(
+    maximumTocWidthForCurrentPane(),
+    Math.max(NOVEL_VIEWER_TOC_WIDTH_MIN, requestedWidth)
+  );
+  applyNovelViewerTocLayout();
+}
+
+function setupNovelViewerTocResize(): void {
+  let startX = 0;
+  let startWidth = NOVEL_VIEWER_TOC_WIDTH_DEFAULT;
+  let pointerId: number | null = null;
+
+  const finish = (): void => {
+    if (!novelViewerTocResizing) return;
+    novelViewerTocResizing = false;
+    persistNovelViewerTocWidth();
+    if (pointerId !== null && novelViewerTocResizer.hasPointerCapture(pointerId)) {
+      novelViewerTocResizer.releasePointerCapture(pointerId);
+    }
+    pointerId = null;
+    document.body.classList.remove("is-novel-viewer-toc-resizing");
+    syncNovelViewerOcclusion(true);
+    applyNovelViewerTocLayout();
+  };
+
+  novelViewerTocResizer.addEventListener("pointerdown", (event) => {
+    if (event.button !== 0 || !novelViewerTocOpen || novelViewerTocNarrow || novelViewerMainSplitResizing) return;
+    event.preventDefault();
+    startX = event.clientX;
+    startWidth = novelViewerTocWidthPx;
+    pointerId = event.pointerId;
+    novelViewerTocResizing = true;
+    novelViewerTocResizer.setPointerCapture(event.pointerId);
+    document.body.classList.add("is-novel-viewer-toc-resizing");
+    syncNovelViewerOcclusion(true);
+  });
+
+  document.addEventListener("pointermove", (event) => {
+    if (!novelViewerTocResizing || event.pointerId !== pointerId) return;
+    event.preventDefault();
+    applyRequestedTocWidth(startWidth + event.clientX - startX);
+  });
+  document.addEventListener("pointerup", (event) => {
+    if (event.pointerId === pointerId) finish();
+  });
+  document.addEventListener("pointercancel", (event) => {
+    if (event.pointerId === pointerId) finish();
+  });
+  novelViewerTocResizer.addEventListener("lostpointercapture", finish);
+  window.addEventListener("blur", finish);
+
+  novelViewerTocResizer.addEventListener("keydown", (event) => {
+    if (!novelViewerTocOpen || novelViewerTocNarrow || novelViewerMainSplitResizing) return;
+    const step = event.shiftKey ? 30 : 10;
+    let requestedWidth: number | undefined;
+    if (event.key === "ArrowLeft") requestedWidth = novelViewerTocWidthPx - step;
+    else if (event.key === "ArrowRight") requestedWidth = novelViewerTocWidthPx + step;
+    else if (event.key === "Home") requestedWidth = NOVEL_VIEWER_TOC_WIDTH_MIN;
+    else if (event.key === "End") requestedWidth = maximumTocWidthForCurrentPane();
+    if (requestedWidth === undefined) return;
+    event.preventDefault();
+    applyRequestedTocWidth(requestedWidth);
+    persistNovelViewerTocWidth();
+  });
+}
+
 function setupSplitResize(): void {
-  let resizing = false;
+  let resizing: "editor" | "novel-viewer" | null = null;
+  let pointerId: number | null = null;
 
   splitResizer.addEventListener("pointerdown", (event) => {
-    if (novelViewerOpen || workspace.layout.splitMode !== "vertical") {
-      return;
+    if (event.button !== 0 || novelViewerTocResizing) return;
+    if (novelViewerOpen) {
+      if (novelViewerSinglePane) return;
+      resizing = "novel-viewer";
+      novelViewerMainSplitResizing = true;
+      syncNovelViewerOcclusion(true);
+    } else {
+      if (workspace.layout.splitMode !== "vertical") return;
+      resizing = "editor";
     }
-    resizing = true;
+    event.preventDefault();
+    pointerId = event.pointerId;
     splitResizer.setPointerCapture(event.pointerId);
     document.body.classList.add("is-split-resizing");
   });
 
   document.addEventListener("pointermove", (event) => {
-    if (!resizing) {
-      return;
-    }
+    if (!resizing || event.pointerId !== pointerId) return;
+    event.preventDefault();
     const rect = editorSplit.getBoundingClientRect();
     const usableWidth = Math.max(1, rect.width - SPLIT_RESIZER_WIDTH);
     const requestedRatio = (event.clientX - rect.left) / usableWidth;
+    if (resizing === "novel-viewer") {
+      novelViewerSplitRatio = clampNovelViewerSplitRatioForWidth(
+        Math.min(NOVEL_VIEWER_SPLIT_RATIO_MAX, Math.max(NOVEL_VIEWER_SPLIT_RATIO_MIN, requestedRatio)),
+        rect.width
+      );
+      applySplitColumns(true);
+      applyNovelViewerTocLayout();
+      scheduleNovelViewerBounds();
+      return;
+    }
     const normalizedRatio = Math.min(0.8, Math.max(0.2, requestedRatio));
     workspace.layout.splitRatio = clampSplitRatioForWidth(normalizedRatio, rect.width);
     applySplitColumns(true);
   });
 
-  const finish = (event: PointerEvent): void => {
-    if (!resizing) {
-      return;
+  const finish = (): void => {
+    if (!resizing) return;
+    const finishedMode = resizing;
+    resizing = null;
+    if (finishedMode === "novel-viewer") {
+      novelViewerMainSplitResizing = false;
+      persistNovelViewerSplitRatio();
     }
-    resizing = false;
-    if (splitResizer.hasPointerCapture(event.pointerId)) {
-      splitResizer.releasePointerCapture(event.pointerId);
+    if (pointerId !== null && splitResizer.hasPointerCapture(pointerId)) {
+      splitResizer.releasePointerCapture(pointerId);
     }
+    pointerId = null;
     document.body.classList.remove("is-split-resizing");
-    void saveWorkspace();
+    if (finishedMode === "novel-viewer") {
+      syncNovelViewerOcclusion(true);
+      applyNovelViewerLayout();
+    } else {
+      void saveWorkspace();
+    }
   };
 
-  document.addEventListener("pointerup", finish);
-  document.addEventListener("pointercancel", finish);
+  document.addEventListener("pointerup", (event) => {
+    if (event.pointerId === pointerId) finish();
+  });
+  document.addEventListener("pointercancel", (event) => {
+    if (event.pointerId === pointerId) finish();
+  });
+  splitResizer.addEventListener("lostpointercapture", finish);
+  window.addEventListener("blur", finish);
+
+  splitResizer.addEventListener("keydown", (event) => {
+    if (!novelViewerOpen || novelViewerSinglePane || novelViewerTocResizing) return;
+    const rect = editorSplit.getBoundingClientRect();
+    const usableWidth = Math.max(1, rect.width - SPLIT_RESIZER_WIDTH);
+    const displayedRatio = clampNovelViewerSplitRatioForWidth(normalizedNovelViewerSplitRatio(), rect.width);
+    const step = event.shiftKey ? 30 : 10;
+    let requestedLeftWidth: number | undefined;
+    if (event.key === "ArrowLeft") requestedLeftWidth = displayedRatio * usableWidth - step;
+    else if (event.key === "ArrowRight") requestedLeftWidth = displayedRatio * usableWidth + step;
+    else if (event.key === "Home") requestedLeftWidth = NOVEL_VIEWER_EDITOR_MIN_WIDTH;
+    else if (event.key === "End") requestedLeftWidth = usableWidth - NOVEL_VIEWER_PANE_MIN_WIDTH;
+    if (requestedLeftWidth === undefined) return;
+    event.preventDefault();
+    novelViewerSplitRatio = clampNovelViewerSplitRatioForWidth(requestedLeftWidth / usableWidth, rect.width);
+    applySplitColumns(true);
+    applyNovelViewerTocLayout();
+    scheduleNovelViewerBounds();
+    persistNovelViewerSplitRatio();
+  });
 }
 
 function setupSidebarResize(): void {
@@ -3843,6 +4313,10 @@ async function performAction(
   else if (action === "novel-viewer-back") renderNovelViewerStatus(await window.textEditor.goBackNovelViewer());
   else if (action === "novel-viewer-forward") renderNovelViewerStatus(await window.textEditor.goForwardNovelViewer());
   else if (action === "novel-viewer-reload") renderNovelViewerStatus(await window.textEditor.reloadOrStopNovelViewer());
+  else if (action === "novel-viewer-toc-toggle") await toggleNovelViewerToc();
+  else if (action === "novel-viewer-toc-close") await closeNovelViewerToc();
+  else if (action === "novel-viewer-toc-refresh") await refreshNovelViewerToc();
+  else if (action === "novel-viewer-toc-episode") await selectNovelViewerTocEpisode(source);
   else if (action === "novel-viewer-external") await window.textEditor.openNovelViewerExternal();
   else if (action === "novel-viewer-close") await closeNovelViewer();
   else if (action === "reload-app") {
@@ -4154,6 +4628,11 @@ document.addEventListener("keydown", (event) => {
       '[data-dialog-action="cancel"], [data-recovery-action="cancel"]'
     );
     cancelButton?.click();
+    if (novelViewerTocOpen && !overlay) {
+      event.preventDefault();
+      void closeNovelViewerToc();
+      return;
+    }
     if (document.activeElement === activeTitleInput) {
       activeTitleInput.value = titleBeforeEdit;
       activeTitleInput.blur();
@@ -4238,6 +4717,9 @@ window.textEditor.onMenuAction((action: MenuAction) => {
 
 window.textEditor.onNovelViewerState((status) => {
   renderNovelViewerStatus(status);
+});
+window.textEditor.onNovelViewerTocState((state) => {
+  renderNovelViewerTocState(state);
 });
 
 window.textEditor.onNovelViewerFocusAddress(() => focusNovelViewerAddress());
@@ -4487,6 +4969,7 @@ async function bootstrap(): Promise<void> {
     createEditor(panes.right);
     setupSidebarResize();
     setupSplitResize();
+    setupNovelViewerTocResize();
     setupNovelViewerLayoutObservers();
     const snapshot = await window.textEditor.loadApp();
     workspace = snapshot.workspace;

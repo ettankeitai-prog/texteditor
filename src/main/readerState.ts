@@ -1,6 +1,13 @@
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
-import type { ReaderScrollState, ReaderState } from "../shared/novelViewer.js";
+import {
+  NOVEL_VIEWER_SPLIT_RATIO_MAX,
+  NOVEL_VIEWER_SPLIT_RATIO_MIN,
+  NOVEL_VIEWER_TOC_WIDTH_MAX,
+  NOVEL_VIEWER_TOC_WIDTH_MIN,
+  type ReaderScrollState,
+  type ReaderState
+} from "../shared/novelViewer.js";
 
 const MAX_SCROLL_VALUE = 100_000_000;
 
@@ -26,6 +33,19 @@ function finiteNumber(value: unknown, maximum: number, field: string): number {
     throw new Error(`Invalid Reader state field: ${field}`);
   }
   return value;
+}
+
+function optionalClampedNumber(
+  value: unknown,
+  minimum: number,
+  maximum: number,
+  field: string
+): number | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    throw new Error(`Invalid Reader state field: ${field}`);
+  }
+  return Math.min(maximum, Math.max(minimum, value));
 }
 
 function normalizeScroll(value: unknown): ReaderScrollState | undefined {
@@ -63,6 +83,18 @@ export function normalizeReaderState(value: unknown): ReaderState {
   if (ui.preferredPane !== "right" && ui.preferredPane !== "current") {
     throw new Error("Invalid Reader state field: ui.preferredPane");
   }
+  const tocWidthPx = optionalClampedNumber(
+    ui.tocWidthPx,
+    NOVEL_VIEWER_TOC_WIDTH_MIN,
+    NOVEL_VIEWER_TOC_WIDTH_MAX,
+    "ui.tocWidthPx"
+  );
+  const novelViewerSplitRatio = optionalClampedNumber(
+    ui.novelViewerSplitRatio,
+    NOVEL_VIEWER_SPLIT_RATIO_MIN,
+    NOVEL_VIEWER_SPLIT_RATIO_MAX,
+    "ui.novelViewerSplitRatio"
+  );
   return {
     schemaVersion: 1,
     progress: {
@@ -73,7 +105,9 @@ export function normalizeReaderState(value: unknown): ReaderState {
     },
     ui: {
       wasOpen: ui.wasOpen,
-      preferredPane: ui.preferredPane
+      preferredPane: ui.preferredPane,
+      ...(tocWidthPx === undefined ? {} : { tocWidthPx }),
+      ...(novelViewerSplitRatio === undefined ? {} : { novelViewerSplitRatio })
     }
   };
 }

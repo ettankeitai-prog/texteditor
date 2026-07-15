@@ -32,6 +32,22 @@ export interface ReaderScrollState {
   progressRatio: number;
 }
 
+export const NOVEL_VIEWER_TOC_WIDTH_DEFAULT = 280;
+export const NOVEL_VIEWER_TOC_WIDTH_MIN = 220;
+export const NOVEL_VIEWER_TOC_WIDTH_MAX = 420;
+export const NOVEL_VIEWER_TOC_RESIZER_WIDTH = 5;
+export const NOVEL_VIEWER_TOC_REMOTE_MIN_WIDTH = 320;
+export const NOVEL_VIEWER_SPLIT_RATIO_DEFAULT = 0.5;
+export const NOVEL_VIEWER_SPLIT_RATIO_MIN = 0.1;
+export const NOVEL_VIEWER_SPLIT_RATIO_MAX = 0.9;
+export const NOVEL_VIEWER_EDITOR_MIN_WIDTH = 320;
+export const NOVEL_VIEWER_PANE_MIN_WIDTH = 480;
+
+export interface NovelViewerUiLayoutUpdate {
+  tocWidthPx?: number;
+  novelViewerSplitRatio?: number;
+}
+
 export interface ReaderState {
   schemaVersion: 1;
   progress: {
@@ -43,6 +59,8 @@ export interface ReaderState {
   ui: {
     wasOpen: boolean;
     preferredPane: "right" | "current";
+    tocWidthPx?: number;
+    novelViewerSplitRatio?: number;
   };
 }
 
@@ -56,7 +74,84 @@ export interface NovelViewerStatus {
   loading: boolean;
   canGoBack: boolean;
   canGoForward: boolean;
+  tocWidthPx?: number;
+  novelViewerSplitRatio?: number;
   error?: NovelViewerErrorState;
+}
+
+export type NovelViewerAdapterId = "kakuyomu" | "narou";
+
+export interface NovelViewerWorkIdentity {
+  adapterId: NovelViewerAdapterId;
+  adapterVersion: number;
+  workId: string;
+  canonicalWorkUrl: string;
+  currentEpisodeId?: string;
+}
+
+export interface NovelViewerTocEpisode {
+  episodeId: string;
+  order: number;
+  title: string;
+  canonicalUrl: string;
+}
+
+export interface NovelViewerTocSection {
+  sectionId?: string;
+  order: number;
+  title?: string;
+  episodes: NovelViewerTocEpisode[];
+}
+
+export interface NovelViewerToc {
+  schemaVersion: 1;
+  adapterId: NovelViewerAdapterId;
+  adapterVersion: number;
+  workId: string;
+  workTitle: string;
+  canonicalWorkUrl: string;
+  sections: NovelViewerTocSection[];
+  fetchedAt: string;
+}
+
+export type NovelViewerTocStatus =
+  | "closed"
+  | "unsupported"
+  | "idle"
+  | "loading"
+  | "ready"
+  | "stale"
+  | "error";
+
+export type NovelViewerTocErrorCode =
+  | "extraction-failed"
+  | "invalid-result"
+  | "fetch-failed"
+  | "too-large";
+
+export interface NovelViewerTocState {
+  status: NovelViewerTocStatus;
+  panelOpen: boolean;
+  supported: boolean;
+  adapterId?: NovelViewerAdapterId;
+  workId?: string;
+  workTitle?: string;
+  sections: NovelViewerTocSection[];
+  currentEpisodeId?: string;
+  cached: boolean;
+  stale: boolean;
+  fetchedAt?: string;
+  canRefresh: boolean;
+  error?: {
+    code: NovelViewerTocErrorCode;
+    message: string;
+  };
+}
+
+export interface NovelViewerTocEpisodeSelection {
+  adapterId: NovelViewerAdapterId;
+  workId: string;
+  episodeId: string;
 }
 
 export interface NovelViewerStartupState {
@@ -79,7 +174,10 @@ export type NovelViewerOcclusionReason =
   | "editor-search"
   | "global-search"
   | "command-palette"
-  | "workspace-import";
+  | "workspace-import"
+  | "toc-panel-narrow"
+  | "toc-resize"
+  | "main-split-resize";
 
 export interface NovelViewerOcclusionUpdate {
   revision: number;

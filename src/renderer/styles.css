@@ -539,7 +539,7 @@ body.is-resizing {
 
 .novel-viewer-header {
   display: grid;
-  grid-template-columns: 30px 30px 30px minmax(80px, 1fr) 30px 30px;
+  grid-template-columns: 30px 30px 30px 30px minmax(80px, 1fr) 30px 30px;
   align-items: center;
   gap: 4px;
   min-width: 0;
@@ -561,6 +561,11 @@ body.is-resizing {
   opacity: 0.4;
 }
 
+.novel-viewer-button.is-active {
+  background: var(--active);
+  color: var(--text);
+}
+
 .novel-viewer-address {
   width: 100%;
   min-width: 0;
@@ -579,12 +584,201 @@ body.is-resizing {
   border-color: var(--accent);
 }
 
-.novel-viewer-slot {
+.novel-viewer-content {
   position: relative;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
   min-width: 0;
   min-height: 0;
   overflow: hidden;
   background: var(--bg);
+}
+
+.novel-viewer-content.is-toc-wide {
+  grid-template-columns:
+    var(--novel-viewer-toc-width)
+    var(--novel-viewer-toc-resizer-width)
+    minmax(var(--novel-viewer-remote-min-width), 1fr);
+}
+
+.novel-viewer-slot {
+  position: relative;
+  grid-column: 1;
+  grid-row: 1;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  background: var(--bg);
+}
+
+.novel-viewer-content.is-toc-wide .novel-viewer-slot {
+  grid-column: 3;
+}
+
+.novel-viewer-toc-panel {
+  z-index: 2;
+  display: grid;
+  grid-column: 1;
+  grid-row: 1;
+  grid-template-rows: auto auto auto minmax(0, 1fr);
+  width: 100%;
+  min-width: 0;
+  min-height: 0;
+  border-right: 1px solid var(--border);
+  background: var(--panel);
+}
+
+.novel-viewer-toc-panel[hidden] {
+  display: none !important;
+}
+
+.novel-viewer-content.is-toc-narrow .novel-viewer-toc-panel {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  border-right: 0;
+}
+
+.novel-viewer-toc-resizer {
+  z-index: 3;
+  grid-column: 2;
+  grid-row: 1;
+  width: var(--novel-viewer-toc-resizer-width);
+  min-width: var(--novel-viewer-toc-resizer-width);
+  cursor: col-resize;
+  background: var(--border);
+  transition: background-color 120ms ease;
+}
+
+.novel-viewer-toc-resizer[hidden] {
+  display: none !important;
+}
+
+.novel-viewer-toc-resizer:hover,
+.novel-viewer-toc-resizer:focus-visible,
+body.is-novel-viewer-toc-resizing .novel-viewer-toc-resizer {
+  outline: none;
+  background: var(--accent);
+}
+
+body.is-novel-viewer-toc-resizing {
+  cursor: col-resize;
+  user-select: none;
+}
+
+.novel-viewer-toc-header {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 28px 28px;
+  align-items: center;
+  gap: 4px;
+  padding: 8px;
+  border-bottom: 1px solid var(--border);
+}
+
+.novel-viewer-toc-heading {
+  overflow: hidden;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.novel-viewer-toc-control {
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  color: var(--muted);
+  font-size: 15px;
+}
+
+.novel-viewer-toc-control:disabled {
+  cursor: default;
+  opacity: 0.4;
+}
+
+.novel-viewer-toc-meta {
+  padding: 8px 10px 4px;
+}
+
+.novel-viewer-toc-work-title {
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+.novel-viewer-toc-detail {
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.4;
+}
+
+.novel-viewer-toc-status {
+  padding: 8px 10px;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.novel-viewer-toc-status[hidden] {
+  display: none;
+}
+
+.novel-viewer-toc-status.is-error {
+  color: var(--danger);
+}
+
+.novel-viewer-toc-list {
+  min-height: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+  padding: 6px 8px 12px;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+}
+
+.novel-viewer-toc-section + .novel-viewer-toc-section {
+  margin-top: 10px;
+}
+
+.novel-viewer-toc-section-title {
+  margin: 0;
+  padding: 5px 6px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+.novel-viewer-toc-episode {
+  display: block;
+  width: 100%;
+  min-height: 30px;
+  padding: 6px 8px;
+  border-radius: 4px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.4;
+  text-align: left;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.novel-viewer-toc-episode:hover,
+.novel-viewer-toc-episode:focus-visible {
+  background: var(--hover);
+  color: var(--text);
+}
+
+.novel-viewer-toc-episode.is-current {
+  background: var(--active);
+  color: var(--accent);
+  font-weight: 600;
 }
 
 .novel-viewer-local-state {

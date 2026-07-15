@@ -38,12 +38,16 @@ import {
   shouldShowNovelViewerDiagnosticMenu
 } from "./novelViewerDiagnostics.js";
 import { ReaderStateStore } from "./readerState.js";
+import { NovelViewerTocCache } from "./novelViewer/novelViewerTocCache.js";
 import type {
   NovelViewerBoundsUpdate,
   NovelViewerOcclusionUpdate,
   NovelViewerRendererDiagnosticSnapshot,
   NovelViewerStartupState,
-  NovelViewerStatus
+  NovelViewerStatus,
+  NovelViewerTocEpisodeSelection,
+  NovelViewerTocState,
+  NovelViewerUiLayoutUpdate
 } from "../shared/novelViewer.js";
 
 type MenuAction =
@@ -265,6 +269,10 @@ function sessionPath(): string {
 
 function readerStatePath(): string {
   return path.join(app.getPath("userData"), "reader", "state.json");
+}
+
+function novelViewerTocCachePath(): string {
+  return path.join(app.getPath("userData"), "reader", "toc-cache.json");
 }
 
 function novelViewerDebugLogPath(): string {
@@ -1094,7 +1102,8 @@ function createWindow(): void {
   const readerController = new NovelViewerController(
     mainWindow,
     new ReaderStateStore(readerStatePath()),
-    readerDiagnostics
+    readerDiagnostics,
+    new NovelViewerTocCache(novelViewerTocCachePath())
   );
   novelViewerController = readerController;
 
@@ -1393,6 +1402,50 @@ ipcMain.handle("novel-viewer:occlusion", async (event, update: NovelViewerOcclus
 ipcMain.handle("novel-viewer:focus-remote", async (event): Promise<void> => {
   assertTrustedEditorSender(event).focusRemote();
 });
+
+ipcMain.handle("novel-viewer:toc-open", async (event): Promise<NovelViewerTocState> =>
+  assertTrustedEditorSender(event).openToc()
+);
+
+ipcMain.handle("novel-viewer:toc-close", async (event): Promise<NovelViewerTocState> =>
+  assertTrustedEditorSender(event).closeToc()
+);
+
+ipcMain.handle("novel-viewer:toc-refresh", async (event): Promise<NovelViewerTocState> =>
+  assertTrustedEditorSender(event).refreshToc()
+);
+
+ipcMain.handle(
+  "novel-viewer:toc-select-episode",
+  async (event, selection: NovelViewerTocEpisodeSelection): Promise<NovelViewerStatus> => {
+    if (
+      !selection || typeof selection !== "object" || Array.isArray(selection) ||
+      !["kakuyomu", "narou"].includes(selection.adapterId) ||
+      typeof selection.workId !== "string" || selection.workId.length === 0 || selection.workId.length > 128 ||
+      typeof selection.episodeId !== "string" || selection.episodeId.length === 0 || selection.episodeId.length > 128
+    ) throw new Error("Invalid Novel Viewer TOC episode selection.");
+    return assertTrustedEditorSender(event).selectTocEpisode(selection);
+  }
+);
+
+ipcMain.handle(
+  "novel-viewer:update-ui-layout",
+  async (event, update: NovelViewerUiLayoutUpdate): Promise<NovelViewerStatus> => {
+    const controller = assertTrustedEditorSender(event);
+    if (!update || typeof update !== "object" || Array.isArray(update)) {
+      throw new Error("Invalid Novel Viewer UI layout update.");
+    }
+    const keys = Object.keys(update);
+    if (
+      keys.length === 0 ||
+      keys.some((key) => key !== "tocWidthPx" && key !== "novelViewerSplitRatio") ||
+      Object.values(update).some((value) => typeof value !== "number" || !Number.isFinite(value))
+    ) {
+      throw new Error("Invalid Novel Viewer UI layout update.");
+    }
+    return controller.updateUiLayout(update);
+  }
+);
 
 ipcMain.handle(
   "novel-viewer:diagnostic-renderer-snapshot",

@@ -100,7 +100,7 @@ export class RemoteInboxServer {
   private async handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
     securityHeaders(response);
     const url = new URL(request.url ?? "/", "http://127.0.0.1");
-    if (request.method === "GET" && url.pathname === "/api/health") return json(response, 200, { ok: true, version: "1.9.0" });
+    if (request.method === "GET" && url.pathname === "/api/health") return json(response, 200, { ok: true, version: "2.0.0" });
     if (request.method === "GET" && url.pathname === "/") return this.form(request, response);
     if (request.method === "GET" && url.pathname === "/api/read") return this.read(url, request, response);
     if (request.method === "GET" && url.pathname === "/api/remote-inbox") return this.getRemoteInbox(url, request, response);

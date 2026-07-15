@@ -1,5 +1,7 @@
 import { app, BrowserWindow, WebContentsView, session, shell } from "electron";
 import type { Input, Rectangle, Session, View, WebContents } from "electron";
+import { readFile } from "node:fs/promises";
+import path from "node:path";
 import type {
   NovelViewerBoundsUpdate,
   NovelViewerErrorCode,
@@ -8,11 +10,24 @@ import type {
   NovelViewerRendererDiagnosticSnapshot,
   NovelViewerStartupState,
   NovelViewerStatus,
+  NovelViewerTocEpisodeSelection,
+  NovelViewerTocState,
+  NovelViewerUiLayoutUpdate,
   ReaderScrollState,
   ReaderState
 } from "../shared/novelViewer.js";
+import {
+  NOVEL_VIEWER_SPLIT_RATIO_DEFAULT,
+  NOVEL_VIEWER_SPLIT_RATIO_MAX,
+  NOVEL_VIEWER_SPLIT_RATIO_MIN,
+  NOVEL_VIEWER_TOC_WIDTH_DEFAULT,
+  NOVEL_VIEWER_TOC_WIDTH_MAX,
+  NOVEL_VIEWER_TOC_WIDTH_MIN
+} from "../shared/novelViewer.js";
 import { ReaderStateStore, defaultReaderState } from "./readerState.js";
 import { NovelViewerDiagnostics } from "./novelViewerDiagnostics.js";
+import { NovelViewerTocCache } from "./novelViewer/novelViewerTocCache.js";
+import { NovelViewerTocService } from "./novelViewer/novelViewerTocService.js";
 import {
   NOVEL_VIEWER_TEST_SCHEME,
   isPrivateNetworkAddress,
@@ -32,7 +47,10 @@ const OCCLUSION_REASONS = new Set<NovelViewerOcclusionReason>([
   "editor-search",
   "global-search",
   "command-palette",
-  "workspace-import"
+  "workspace-import",
+  "toc-panel-narrow",
+  "toc-resize",
+  "main-split-resize"
 ]);
 
 type NavigationSource = "input" | "page" | "redirect" | "history" | "reload" | "restore";
@@ -134,12 +152,20 @@ export class NovelViewerController {
   private windowHandlersInstalled = false;
   private shuttingDown = false;
   private readonly allowTestProtocol = !app.isPackaged && process.env.TEXTEDITOR_NOVEL_VIEWER_TEST_MODE === "1";
+  private readonly tocService: NovelViewerTocService;
 
   constructor(
     private readonly window: BrowserWindow,
     private readonly store: ReaderStateStore,
-    private readonly diagnostics: NovelViewerDiagnostics
+    private readonly diagnostics: NovelViewerDiagnostics,
+    tocCache: NovelViewerTocCache
   ) {
+    this.tocService = new NovelViewerTocService(
+      tocCache,
+      (state) => this.sendToEditor("novel-viewer:toc-state", state),
+      (event, details) => this.logDiagnostic(event, details),
+      this.allowTestProtocol
+    );
     this.installWindowHandlers();
     this.logDiagnostic("controller-created");
   }
@@ -168,12 +194,18 @@ export class NovelViewerController {
       loading: this.loading,
       canGoBack: Boolean(history?.canGoBack()),
       canGoForward: Boolean(history?.canGoForward()),
+      tocWidthPx: this.state.ui.tocWidthPx ?? NOVEL_VIEWER_TOC_WIDTH_DEFAULT,
+      novelViewerSplitRatio: this.state.ui.novelViewerSplitRatio ?? NOVEL_VIEWER_SPLIT_RATIO_DEFAULT,
       error: this.error
     };
   }
 
   get diagnosticsEnabled(): boolean {
     return this.diagnostics.enabled;
+  }
+
+  get tocState(): NovelViewerTocState {
+    return this.tocService.state;
   }
 
   async dumpDiagnosticState(reason = "manual"): Promise<void> {
@@ -365,6 +397,59 @@ export class NovelViewerController {
     return true;
   }
 
+  async openToc(): Promise<NovelViewerTocState> {
+    if (!this.isOpen) return this.tocService.state;
+    return this.tocService.open(this.view?.webContents ?? null, this.committedUrl, this.navigationEpoch);
+  }
+
+  closeToc(): NovelViewerTocState {
+    return this.tocService.close(this.view?.webContents ?? null);
+  }
+
+  async refreshToc(): Promise<NovelViewerTocState> {
+    if (!this.isOpen) return this.tocService.state;
+    return this.tocService.refresh(this.view?.webContents ?? null, this.committedUrl, this.navigationEpoch);
+  }
+
+  async selectTocEpisode(selection: NovelViewerTocEpisodeSelection): Promise<NovelViewerStatus> {
+    const target = this.tocService.selectEpisode(selection);
+    if (!target) throw new Error("Invalid Novel Viewer TOC episode selection.");
+    return this.navigate(target, "input");
+  }
+
+  async updateUiLayout(update: NovelViewerUiLayoutUpdate): Promise<NovelViewerStatus> {
+    await this.ensureInitialized();
+    if (!update || typeof update !== "object" || Array.isArray(update)) {
+      throw new Error("Invalid Novel Viewer UI layout update.");
+    }
+    const hasTocWidth = update.tocWidthPx !== undefined;
+    const hasSplitRatio = update.novelViewerSplitRatio !== undefined;
+    if (!hasTocWidth && !hasSplitRatio) throw new Error("Novel Viewer UI layout update is empty.");
+    if (
+      (hasTocWidth && (typeof update.tocWidthPx !== "number" || !Number.isFinite(update.tocWidthPx))) ||
+      (hasSplitRatio && (
+        typeof update.novelViewerSplitRatio !== "number" || !Number.isFinite(update.novelViewerSplitRatio)
+      ))
+    ) {
+      throw new Error("Invalid Novel Viewer UI layout value.");
+    }
+    if (hasTocWidth) {
+      this.state.ui.tocWidthPx = Math.min(
+        NOVEL_VIEWER_TOC_WIDTH_MAX,
+        Math.max(NOVEL_VIEWER_TOC_WIDTH_MIN, update.tocWidthPx as number)
+      );
+    }
+    if (hasSplitRatio) {
+      this.state.ui.novelViewerSplitRatio = Math.min(
+        NOVEL_VIEWER_SPLIT_RATIO_MAX,
+        Math.max(NOVEL_VIEWER_SPLIT_RATIO_MIN, update.novelViewerSplitRatio as number)
+      );
+    }
+    await this.persistState(false);
+    this.emitStatus();
+    return this.status;
+  }
+
   updateBounds(update: NovelViewerBoundsUpdate): void {
     this.logDiagnostic("renderer-bounds-received", { update });
     if (
@@ -446,6 +531,7 @@ export class NovelViewerController {
     this.shuttingDown = true;
     this.removeWindowHandlers();
     await this.disposeView(true, checkpointAlreadyTaken ? 0 : 1_200);
+    await timeout(this.tocService.waitForIdle(), 600);
     await timeout(this.store.waitForIdle(), 600);
     this.logDiagnostic("controller-shutdown-after");
     await timeout(this.diagnostics.flush(), 600);
@@ -589,6 +675,15 @@ export class NovelViewerController {
     readerSession.protocol.handle(scheme, async (request) => {
       const requestUrl = new URL(request.url);
       const page = safeText(requestUrl.pathname, 120) ?? "/";
+      const tocFixture = this.testTocFixtureName(page);
+      if (tocFixture) {
+        try {
+          const body = await readFile(path.join(app.getAppPath(), "tests", "fixtures", "novel-viewer", tocFixture), "utf8");
+          return new Response(body, { headers: { "content-type": "text/html; charset=utf-8" } });
+        } catch {
+          return new Response("TOC fixture unavailable", { status: 500, headers: { "content-type": "text/plain" } });
+        }
+      }
       if (page === "/slow.svg") {
         await new Promise((resolve) => setTimeout(resolve, 900));
         return new Response('<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"/>', {
@@ -641,6 +736,14 @@ export class NovelViewerController {
         <div style="height:3900px"></div><p id="bottom">Bottom</p></body>`;
       return new Response(body, { headers: { "content-type": "text/html; charset=utf-8" } });
     });
+  }
+
+  private testTocFixtureName(page: string): string | null {
+    if (/^\/toc\/kakuyomu\/works\/work-alpha\/?$/.test(page)) return "kakuyomu-work.html";
+    if (/^\/toc\/kakuyomu\/works\/work-alpha\/episodes\/episode-[12]\/?$/.test(page)) return "kakuyomu-episode.html";
+    if (/^\/toc\/narou\/n1234ab\/?$/.test(page)) return "narou-work.html";
+    if (/^\/toc\/narou\/n1234ab\/[12]\/?$/.test(page)) return "narou-episode.html";
+    return null;
   }
 
   private ensureView(): void {
@@ -841,6 +944,7 @@ export class NovelViewerController {
       this.pendingUrl = undefined;
       this.loading = false;
       this.error = undefined;
+      this.tocService.setLocation(this.committedUrl, this.navigationEpoch, contents);
       this.markReadable(this.navigationEpoch);
     });
     contents.on("did-finish-load", () => {
@@ -944,6 +1048,7 @@ export class NovelViewerController {
     this.loading = true;
     this.error = undefined;
     this.mainResponseStatus = 0;
+    this.tocService.setLocation(this.committedUrl, this.navigationEpoch, this.view?.webContents ?? null);
     this.updateLifecycleAndVisibility();
     return this.navigationEpoch;
   }
@@ -958,6 +1063,7 @@ export class NovelViewerController {
     this.committedUrl = validated.url.href;
     this.pendingUrl = validated.url.href;
     if (responseCode > 0) this.mainResponseStatus = responseCode;
+    this.tocService.setLocation(this.committedUrl, this.navigationEpoch, this.view?.webContents ?? null);
     this.emitStatus();
   }
 
@@ -980,6 +1086,7 @@ export class NovelViewerController {
     this.markReadable(epoch);
     await this.initializeRestoreInteraction(epoch);
     this.scheduleScrollRestore(epoch);
+    void this.tocService.documentReady(contents, this.committedUrl, epoch);
   }
 
   private markReadable(epoch: number): void {
@@ -1447,6 +1554,7 @@ export class NovelViewerController {
   private async disposeRemoteOnly(): Promise<void> {
     const view = this.view;
     if (!view) return;
+    await this.tocService.dispose(view.webContents);
     this.logDiagnostic("reader-view-dispose-before");
     try {
       this.removeReaderViewFromCurrentContentView(view, "reader-view-dispose");
@@ -1468,6 +1576,7 @@ export class NovelViewerController {
   private detachDeadView(): void {
     const view = this.view;
     if (!view) return;
+    void this.tocService.dispose(null);
     this.logDiagnostic("reader-view-detach-dead-before");
     this.clearRestoreTimers();
     this.clearDeferredTimers();

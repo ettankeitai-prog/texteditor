@@ -2,6 +2,18 @@
 
 Electron + TypeScript + CodeMirror 6 で作成した、軽量な小説・日常メモ用テキストエディタです。
 
+## v2.0.0
+
+v2.0.0 は、通常文書から分離した安全なNovel Viewerと、カクヨム／小説家になろう対応の目次機能を追加するリリースです。
+
+- main process管理の単一`WebContentsView`と非永続Reader Session
+- navigation、permission、popup、download、private networkへの制限
+- Reader専用のURL／スクロール状態保存と復元
+- カクヨム／小説家になろうの静的目次Adapterと作品単位cache
+- wide／narrow目次Side Panel、現在話強調、安全な話移動
+- TOC幅とEditor／Novel Viewer専用分割比率の調整・保存
+- Windowsの一時的なcache renameロックに対する限定retry
+
 ## v1.9.0
 
 v1.9.0 は既存JSON、自動保存、セッション復元、タブ中心の操作を維持した保全性・操作性改善リリースです。
@@ -57,8 +69,8 @@ npm run dist
 
 ```text
 dist/
-  Text Editor Setup 1.9.0.exe
-  Text Editor 1.9.0.exe
+  Text Editor Setup 2.0.0.exe
+  Text Editor 2.0.0.exe
 ```
 
 開発中にレンダラーだけ確認する場合:
@@ -539,7 +551,7 @@ version.json
 
 ```json
 {
-  "appVersion": "1.9.0",
+  "appVersion": "2.0.0",
   "workspaceVersion": 1,
   "createdAt": "2026-07-08T12:00:00.000Z"
 }

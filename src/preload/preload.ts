@@ -14,7 +14,10 @@ import type {
   NovelViewerOcclusionUpdate,
   NovelViewerRendererDiagnosticSnapshot,
   NovelViewerStartupState,
-  NovelViewerStatus
+  NovelViewerStatus,
+  NovelViewerTocEpisodeSelection,
+  NovelViewerTocState,
+  NovelViewerUiLayoutUpdate
 } from "../shared/novelViewer.js";
 
 type MenuAction =
@@ -142,10 +145,22 @@ const api = {
   updateNovelViewerBounds: (update: NovelViewerBoundsUpdate): Promise<void> => ipcRenderer.invoke("novel-viewer:bounds", update),
   setNovelViewerOcclusion: (update: NovelViewerOcclusionUpdate): Promise<void> => ipcRenderer.invoke("novel-viewer:occlusion", update),
   focusNovelViewerRemote: (): Promise<void> => ipcRenderer.invoke("novel-viewer:focus-remote"),
+  openNovelViewerToc: (): Promise<NovelViewerTocState> => ipcRenderer.invoke("novel-viewer:toc-open"),
+  closeNovelViewerToc: (): Promise<NovelViewerTocState> => ipcRenderer.invoke("novel-viewer:toc-close"),
+  refreshNovelViewerToc: (): Promise<NovelViewerTocState> => ipcRenderer.invoke("novel-viewer:toc-refresh"),
+  selectNovelViewerTocEpisode: (selection: NovelViewerTocEpisodeSelection): Promise<NovelViewerStatus> =>
+    ipcRenderer.invoke("novel-viewer:toc-select-episode", selection),
+  updateNovelViewerUiLayout: (update: NovelViewerUiLayoutUpdate): Promise<NovelViewerStatus> =>
+    ipcRenderer.invoke("novel-viewer:update-ui-layout", update),
   onNovelViewerState: (callback: (status: NovelViewerStatus) => void): (() => void) => {
     const listener = (_event: Electron.IpcRendererEvent, status: NovelViewerStatus): void => callback(status);
     ipcRenderer.on("novel-viewer:state", listener);
     return () => ipcRenderer.removeListener("novel-viewer:state", listener);
+  },
+  onNovelViewerTocState: (callback: (state: NovelViewerTocState) => void): (() => void) => {
+    const listener = (_event: Electron.IpcRendererEvent, state: NovelViewerTocState): void => callback(state);
+    ipcRenderer.on("novel-viewer:toc-state", listener);
+    return () => ipcRenderer.removeListener("novel-viewer:toc-state", listener);
   },
   onNovelViewerFocusAddress: (callback: () => void): (() => void) => {
     const listener = (): void => callback();
