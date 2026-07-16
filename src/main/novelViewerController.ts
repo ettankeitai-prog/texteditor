@@ -5,6 +5,7 @@ import path from "node:path";
 import type {
   NovelViewerBoundsUpdate,
   NovelViewerErrorCode,
+  NovelViewerFavoritesState,
   NovelViewerOcclusionReason,
   NovelViewerOcclusionUpdate,
   NovelViewerRendererDiagnosticSnapshot,
@@ -24,6 +25,11 @@ import {
   NOVEL_VIEWER_TOC_WIDTH_MAX,
   NOVEL_VIEWER_TOC_WIDTH_MIN
 } from "../shared/novelViewer.js";
+import {
+  addNovelViewerFavorite,
+  normalizeNovelViewerWorkUrl,
+  removeNovelViewerFavorite
+} from "../shared/novelViewerFavorites.js";
 import { ReaderStateStore, defaultReaderState } from "./readerState.js";
 import { NovelViewerDiagnostics } from "./novelViewerDiagnostics.js";
 import { NovelViewerTocCache } from "./novelViewer/novelViewerTocCache.js";
@@ -40,6 +46,7 @@ const CHECKPOINT_INTERVAL_MS = 20_000;
 const MAX_BOUND_VALUE = 100_000;
 const ISOLATED_WORLD_ID = 999;
 const MAX_SCROLL_VALUE = 100_000_000;
+const NARROW_VIEWPORT_MIN_ZOOM = 0.5;
 const SCROLL_RESTORE_DELAYS_MS = [100, 350, 800];
 const OCCLUSION_REASONS = new Set<NovelViewerOcclusionReason>([
   "dialog",
@@ -54,6 +61,28 @@ const OCCLUSION_REASONS = new Set<NovelViewerOcclusionReason>([
 ]);
 
 type NavigationSource = "input" | "page" | "redirect" | "history" | "reload" | "restore";
+
+interface RemoteViewportMeasurement {
+  innerWidth: number;
+  innerHeight: number;
+  visualWidth: number;
+  visualHeight: number;
+  documentWidth: number;
+}
+
+interface RemoteViewportDiagnosticSnapshot {
+  generation: number;
+  layoutRevision: number;
+  bounds: Rectangle;
+  viewportBeforeZoom?: RemoteViewportMeasurement;
+  viewportAfterZoom?: RemoteViewportMeasurement;
+  narrow: boolean;
+  zoomFactorBefore: number;
+  zoomFactorAfter: number;
+  boundsUpdatedAt?: string;
+  zoomUpdatedAt?: string;
+  updatedAt: string;
+}
 
 let nextViewObjectIdentifier = 0;
 const viewObjectIdentifiers = new WeakMap<object, number>();
@@ -143,6 +172,11 @@ export class NovelViewerController {
   private userInteractionEpoch = -1;
   private mainResponseStatus = 0;
   private latestBoundsRevision = -1;
+  private viewportSyncGeneration = 0;
+  private remoteZoomFactor = 1;
+  private lastBoundsUpdatedAt: string | undefined;
+  private lastZoomUpdatedAt: string | undefined;
+  private remoteViewportDiagnostic: RemoteViewportDiagnosticSnapshot | null = null;
   private lastValidBounds: Rectangle | null = null;
   private layoutVisible = false;
   private checkpointTimer: NodeJS.Timeout | null = null;
@@ -206,6 +240,21 @@ export class NovelViewerController {
 
   get tocState(): NovelViewerTocState {
     return this.tocService.state;
+  }
+
+  get favoritesState(): NovelViewerFavoritesState {
+    const currentWork = normalizeNovelViewerWorkUrl(this.committedUrl, {
+      allowTestProtocol: this.allowTestProtocol
+    });
+    const currentWorkUrl = currentWork?.canonicalWorkUrl;
+    return {
+      items: structuredClone(this.state.favorites),
+      supported: Boolean(currentWork),
+      ...(currentWorkUrl ? { currentWorkUrl } : {}),
+      currentFavorite: Boolean(
+        currentWorkUrl && this.state.favorites.some((entry) => entry.canonicalWorkUrl === currentWorkUrl)
+      )
+    };
   }
 
   async dumpDiagnosticState(reason = "manual"): Promise<void> {
@@ -417,6 +466,59 @@ export class NovelViewerController {
     return this.navigate(target, "input");
   }
 
+  async toggleFavorite(): Promise<NovelViewerFavoritesState> {
+    await this.ensureInitialized();
+    const work = normalizeNovelViewerWorkUrl(this.committedUrl, {
+      allowTestProtocol: this.allowTestProtocol
+    });
+    if (!work || this.stateCorrupt) return this.favoritesState;
+    const existing = this.state.favorites.some((entry) => entry.canonicalWorkUrl === work.canonicalWorkUrl);
+    if (existing) {
+      this.state.favorites = removeNovelViewerFavorite(this.state.favorites, work.canonicalWorkUrl);
+      this.logDiagnostic("favorite-removed", { adapterId: work.adapterId, workId: work.workId });
+    } else {
+      const workTitle = safeText(
+        this.tocService.state.workTitle ?? this.title ?? this.state.progress.title ?? work.workId,
+        300
+      ) ?? work.workId;
+      this.state.favorites = addNovelViewerFavorite(this.state.favorites, {
+        adapterId: work.adapterId,
+        workId: work.workId,
+        canonicalWorkUrl: work.canonicalWorkUrl,
+        workTitle,
+        addedAt: new Date().toISOString()
+      });
+      this.logDiagnostic("favorite-added", { adapterId: work.adapterId, workId: work.workId });
+    }
+    await this.persistState(false);
+    this.emitFavoritesState();
+    return this.favoritesState;
+  }
+
+  async removeFavorite(rawUrl: string): Promise<NovelViewerFavoritesState> {
+    await this.ensureInitialized();
+    const work = normalizeNovelViewerWorkUrl(rawUrl, { allowTestProtocol: this.allowTestProtocol });
+    if (!work || this.stateCorrupt) throw new Error("Invalid Novel Viewer favorite.");
+    this.state.favorites = removeNovelViewerFavorite(this.state.favorites, work.canonicalWorkUrl);
+    await this.persistState(false);
+    this.logDiagnostic("favorite-removed", { adapterId: work.adapterId, workId: work.workId });
+    this.emitFavoritesState();
+    return this.favoritesState;
+  }
+
+  async openFavorite(rawUrl: string): Promise<NovelViewerStatus> {
+    await this.ensureInitialized();
+    const work = normalizeNovelViewerWorkUrl(rawUrl, { allowTestProtocol: this.allowTestProtocol });
+    if (
+      !work ||
+      !this.state.favorites.some((entry) => entry.canonicalWorkUrl === work.canonicalWorkUrl)
+    ) {
+      throw new Error("Invalid Novel Viewer favorite.");
+    }
+    this.logDiagnostic("favorite-opened", { adapterId: work.adapterId, workId: work.workId });
+    return this.navigate(work.canonicalWorkUrl, "input");
+  }
+
   async updateUiLayout(update: NovelViewerUiLayoutUpdate): Promise<NovelViewerStatus> {
     await this.ensureInitialized();
     if (!update || typeof update !== "object" || Array.isArray(update)) {
@@ -485,6 +587,12 @@ export class NovelViewerController {
     // last usable rectangle needed for restore/show recovery.
     this.layoutVisible = update.visible && nextBounds.width > 0 && nextBounds.height > 0;
     this.applyViewVisibility();
+    if (
+      this.layoutVisible && !this.occluded && !this.error && this.committedUrl &&
+      this.view && !this.view.webContents.isDestroyed()
+    ) {
+      this.syncRemoteViewport(this.view, nextBounds, update.layoutRevision);
+    }
     this.logDiagnostic("renderer-bounds-applied", { update });
   }
 
@@ -723,8 +831,9 @@ export class NovelViewerController {
       const blockedTargetMarker = isBlockedTarget
         ? '<p id="blocked-target-marker">BLOCKED_TARGET_FIXTURE_BODY</p><script>window.__novelViewerBlockedTargetExecuted = true;</script>'
         : "";
+      const viewportFixtureStyle = page === "/viewport-wide" ? "min-width:900px" : "";
       const body = `<!doctype html><meta charset="utf-8"><title>${title}</title>
-        <style>body{font-family:sans-serif;margin:20px;min-height:4200px}button,a{display:block;margin:12px}</style>
+        <style>body{font-family:sans-serif;margin:20px;min-height:4200px;${viewportFixtureStyle}}button,a{display:block;margin:12px}</style>
         <body data-page-id="${pageId}">
         <h1>${title}</h1><a id="next" href="${scheme}://fixture/page-b">Next</a>
         <a id="blocked" href="${scheme}://blocked/private">Blocked</a>
@@ -1041,6 +1150,8 @@ export class NovelViewerController {
 
   private beginNavigation(url: string): number {
     this.navigationEpoch += 1;
+    this.viewportSyncGeneration += 1;
+    this.remoteViewportDiagnostic = null;
     this.userInteractionEpoch = -1;
     this.clearRestoreTimers();
     this.clearDeferredTimers();
@@ -1048,6 +1159,11 @@ export class NovelViewerController {
     this.loading = true;
     this.error = undefined;
     this.mainResponseStatus = 0;
+    if (this.view && !this.view.webContents.isDestroyed() && this.remoteZoomFactor !== 1) {
+      this.view.webContents.setZoomFactor(1);
+      this.remoteZoomFactor = 1;
+      this.lastZoomUpdatedAt = new Date().toISOString();
+    }
     this.tocService.setLocation(this.committedUrl, this.navigationEpoch, this.view?.webContents ?? null);
     this.updateLifecycleAndVisibility();
     return this.navigationEpoch;
@@ -1320,7 +1436,159 @@ export class NovelViewerController {
   private setReaderViewBounds(view: WebContentsView, bounds: Rectangle, context: string): void {
     this.logDiagnostic("set-bounds-before", { context, requestedBounds: bounds });
     view.setBounds(bounds);
+    this.lastBoundsUpdatedAt = new Date().toISOString();
     this.logDiagnostic("set-bounds-after", { context, requestedBounds: bounds });
+  }
+
+  private syncRemoteViewport(view: WebContentsView, bounds: Rectangle, layoutRevision: number): void {
+    if (bounds.width <= 0 || bounds.height <= 0 || view.webContents.isDestroyed()) return;
+    const contents = view.webContents;
+    const generation = ++this.viewportSyncGeneration;
+    const zoomFactorBefore = contents.getZoomFactor();
+    this.remoteViewportDiagnostic = {
+      generation,
+      layoutRevision,
+      bounds: { ...bounds },
+      narrow: false,
+      zoomFactorBefore,
+      zoomFactorAfter: zoomFactorBefore,
+      ...(this.lastBoundsUpdatedAt ? { boundsUpdatedAt: this.lastBoundsUpdatedAt } : {}),
+      ...(this.lastZoomUpdatedAt ? { zoomUpdatedAt: this.lastZoomUpdatedAt } : {}),
+      updatedAt: new Date().toISOString()
+    };
+    this.logDiagnostic("remote-viewport-sync-start", {
+      generation,
+      layoutRevision,
+      requestedBounds: bounds,
+      zoomFactorBefore,
+      boundsUpdatedAt: this.lastBoundsUpdatedAt,
+      zoomUpdatedAt: this.lastZoomUpdatedAt
+    });
+    if (Math.abs(zoomFactorBefore - 1) > 0.001) {
+      contents.setZoomFactor(1);
+      this.remoteZoomFactor = 1;
+      this.lastZoomUpdatedAt = new Date().toISOString();
+    }
+    contents.invalidate();
+    void this.completeRemoteViewportSync(view, bounds, layoutRevision, generation, zoomFactorBefore).catch((error: unknown) => {
+      if (generation === this.viewportSyncGeneration && !contents.isDestroyed()) {
+        this.logDiagnostic("remote-viewport-sync-failed", {
+          generation,
+          layoutRevision,
+          message: safeText(error instanceof Error ? error.message : String(error), 200)
+        });
+      }
+    });
+  }
+
+  private async completeRemoteViewportSync(
+    view: WebContentsView,
+    bounds: Rectangle,
+    layoutRevision: number,
+    generation: number,
+    zoomFactorBefore: number
+  ): Promise<void> {
+    const contents = view.webContents;
+    let viewportBeforeZoom = await this.measureRemoteViewport(contents);
+    if (!this.isCurrentViewportSync(view, layoutRevision, generation) || !viewportBeforeZoom) return;
+
+    const widthMismatch = Math.abs(viewportBeforeZoom.innerWidth - bounds.width) > 2;
+    const heightMismatch = Math.abs(viewportBeforeZoom.innerHeight - bounds.height) > 2;
+    if (widthMismatch || heightMismatch) {
+      // Electron normally updates the renderer viewport with setBounds. Reapply
+      // once after detach/show or rapid split transitions, then measure again.
+      this.setReaderViewBounds(view, bounds, "viewport-sync-reapply");
+      contents.invalidate();
+      this.logDiagnostic("remote-viewport-bounds-reapplied", {
+        generation,
+        layoutRevision,
+        requestedBounds: bounds,
+        viewportBeforeZoom
+      });
+      viewportBeforeZoom = await this.measureRemoteViewport(contents);
+      if (!this.isCurrentViewportSync(view, layoutRevision, generation) || !viewportBeforeZoom) return;
+    }
+
+    const hasHorizontalOverflow = viewportBeforeZoom.documentWidth > viewportBeforeZoom.innerWidth + 2;
+    const desiredZoomFactor = hasHorizontalOverflow
+      ? Math.max(NARROW_VIEWPORT_MIN_ZOOM, Math.min(1, bounds.width / viewportBeforeZoom.documentWidth))
+      : 1;
+    let viewportAfterZoom = viewportBeforeZoom;
+    if (desiredZoomFactor < 0.99) {
+      contents.setZoomFactor(desiredZoomFactor);
+      this.remoteZoomFactor = desiredZoomFactor;
+      this.lastZoomUpdatedAt = new Date().toISOString();
+      contents.invalidate();
+      viewportAfterZoom = await this.measureRemoteViewport(contents) ?? viewportBeforeZoom;
+      if (!this.isCurrentViewportSync(view, layoutRevision, generation)) return;
+    } else {
+      this.remoteZoomFactor = 1;
+    }
+
+    const zoomFactorAfter = contents.getZoomFactor();
+    this.remoteViewportDiagnostic = {
+      generation,
+      layoutRevision,
+      bounds: { ...bounds },
+      viewportBeforeZoom,
+      viewportAfterZoom,
+      narrow: zoomFactorAfter < 0.99,
+      zoomFactorBefore,
+      zoomFactorAfter,
+      ...(this.lastBoundsUpdatedAt ? { boundsUpdatedAt: this.lastBoundsUpdatedAt } : {}),
+      ...(this.lastZoomUpdatedAt ? { zoomUpdatedAt: this.lastZoomUpdatedAt } : {}),
+      updatedAt: new Date().toISOString()
+    };
+    this.logDiagnostic("remote-viewport-synchronized", {
+      generation,
+      layoutRevision,
+      requestedBounds: bounds,
+      viewportBeforeZoom,
+      viewportAfterZoom,
+      narrow: zoomFactorAfter < 0.99,
+      zoomFactorBefore,
+      zoomFactorAfter,
+      boundsUpdatedAt: this.lastBoundsUpdatedAt,
+      zoomUpdatedAt: this.lastZoomUpdatedAt
+    });
+  }
+
+  private isCurrentViewportSync(view: WebContentsView, layoutRevision: number, generation: number): boolean {
+    return generation === this.viewportSyncGeneration &&
+      layoutRevision === this.latestBoundsRevision &&
+      this.view === view &&
+      !view.webContents.isDestroyed();
+  }
+
+  private async measureRemoteViewport(contents: WebContents): Promise<RemoteViewportMeasurement | null> {
+    const result = await contents.executeJavaScriptInIsolatedWorld(ISOLATED_WORLD_ID, [{
+      code: `new Promise((resolve) => requestAnimationFrame(() => {
+        window.dispatchEvent(new Event("resize"));
+        requestAnimationFrame(() => resolve({
+          innerWidth: window.innerWidth,
+          innerHeight: window.innerHeight,
+          visualWidth: window.visualViewport?.width ?? window.innerWidth,
+          visualHeight: window.visualViewport?.height ?? window.innerHeight,
+          documentWidth: Math.max(
+            document.documentElement?.scrollWidth || 0,
+            document.body?.scrollWidth || 0
+          )
+        }));
+      }))`
+    }]);
+    if (!result || typeof result !== "object" || Array.isArray(result)) return null;
+    const viewport = result as Record<string, unknown>;
+    const values = [
+      viewport.innerWidth,
+      viewport.innerHeight,
+      viewport.visualWidth,
+      viewport.visualHeight,
+      viewport.documentWidth
+    ];
+    if (!values.every((value) =>
+      typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= MAX_BOUND_VALUE
+    )) return null;
+    return viewport as unknown as RemoteViewportMeasurement;
   }
 
   private setReaderViewVisible(view: WebContentsView, visible: boolean, context: string): void {
@@ -1400,6 +1668,7 @@ export class NovelViewerController {
       rendererOcclusionReasons: [...this.rendererOcclusionReasons],
       boundsRevision: this.latestBoundsRevision,
       occlusionRevision: this.latestOcclusionRevision,
+      remoteViewport: this.remoteViewportDiagnostic,
       navigationEpoch: this.navigationEpoch,
       navigation: {
         pendingUrl: safeDiagnosticUrl(this.pendingUrl),
@@ -1505,6 +1774,11 @@ export class NovelViewerController {
 
   private emitStatus(): void {
     this.sendToEditor("novel-viewer:state", this.status);
+    this.emitFavoritesState();
+  }
+
+  private emitFavoritesState(): void {
+    this.sendToEditor("novel-viewer:favorites-state", this.favoritesState);
   }
 
   private sendToEditor(channel: string, ...args: unknown[]): void {
@@ -1513,6 +1787,9 @@ export class NovelViewerController {
   }
 
   private async disposeView(preserveWasOpen: boolean, checkpointTimeout: number): Promise<void> {
+    this.viewportSyncGeneration += 1;
+    this.remoteZoomFactor = 1;
+    this.remoteViewportDiagnostic = null;
     if (this.windowBoundsRefreshTimer) {
       clearTimeout(this.windowBoundsRefreshTimer);
       this.windowBoundsRefreshTimer = null;

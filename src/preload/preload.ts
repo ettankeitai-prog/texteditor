@@ -11,6 +11,7 @@ import {
 } from "../shared/schema.js";
 import type {
   NovelViewerBoundsUpdate,
+  NovelViewerFavoritesState,
   NovelViewerOcclusionUpdate,
   NovelViewerRendererDiagnosticSnapshot,
   NovelViewerStartupState,
@@ -157,6 +158,12 @@ const api = {
   openNovelViewerToc: (): Promise<NovelViewerTocState> => ipcRenderer.invoke("novel-viewer:toc-open"),
   closeNovelViewerToc: (): Promise<NovelViewerTocState> => ipcRenderer.invoke("novel-viewer:toc-close"),
   refreshNovelViewerToc: (): Promise<NovelViewerTocState> => ipcRenderer.invoke("novel-viewer:toc-refresh"),
+  getNovelViewerFavorites: (): Promise<NovelViewerFavoritesState> => ipcRenderer.invoke("novel-viewer:favorites-get"),
+  toggleNovelViewerFavorite: (): Promise<NovelViewerFavoritesState> => ipcRenderer.invoke("novel-viewer:favorites-toggle"),
+  removeNovelViewerFavorite: (canonicalWorkUrl: string): Promise<NovelViewerFavoritesState> =>
+    ipcRenderer.invoke("novel-viewer:favorites-remove", canonicalWorkUrl),
+  openNovelViewerFavorite: (canonicalWorkUrl: string): Promise<NovelViewerStatus> =>
+    ipcRenderer.invoke("novel-viewer:favorites-open", canonicalWorkUrl),
   selectNovelViewerTocEpisode: (selection: NovelViewerTocEpisodeSelection): Promise<NovelViewerStatus> =>
     ipcRenderer.invoke("novel-viewer:toc-select-episode", selection),
   updateNovelViewerUiLayout: (update: NovelViewerUiLayoutUpdate): Promise<NovelViewerStatus> =>
@@ -170,6 +177,11 @@ const api = {
     const listener = (_event: Electron.IpcRendererEvent, state: NovelViewerTocState): void => callback(state);
     ipcRenderer.on("novel-viewer:toc-state", listener);
     return () => ipcRenderer.removeListener("novel-viewer:toc-state", listener);
+  },
+  onNovelViewerFavoritesState: (callback: (state: NovelViewerFavoritesState) => void): (() => void) => {
+    const listener = (_event: Electron.IpcRendererEvent, state: NovelViewerFavoritesState): void => callback(state);
+    ipcRenderer.on("novel-viewer:favorites-state", listener);
+    return () => ipcRenderer.removeListener("novel-viewer:favorites-state", listener);
   },
   onNovelViewerFocusAddress: (callback: () => void): (() => void) => {
     const listener = (): void => callback();

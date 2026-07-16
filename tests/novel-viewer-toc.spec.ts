@@ -12,8 +12,15 @@ import {
   NOVEL_VIEWER_TOC_WIDTH_DEFAULT,
   NOVEL_VIEWER_TOC_WIDTH_MAX,
   NOVEL_VIEWER_TOC_WIDTH_MIN,
+  type NovelViewerFavorite,
   type NovelViewerToc
 } from "../src/shared/novelViewer";
+import {
+  addNovelViewerFavorite,
+  normalizeNovelViewerFavorites,
+  normalizeNovelViewerWorkUrl,
+  removeNovelViewerFavorite
+} from "../src/shared/novelViewerFavorites";
 import { defaultReaderState, normalizeReaderState, ReaderStateStore } from "../src/main/readerState";
 import { createKakuyomuAdapter, createNarouAdapter } from "../src/main/novelViewer/adapters/index";
 import {
@@ -68,6 +75,11 @@ async function readerViewSnapshot(app: ElectronApplication): Promise<{
   bounds: { x: number; y: number; width: number; height: number };
   url: string;
   scrollY: number;
+  viewportWidth: number;
+  viewportHeight: number;
+  resizeEvents: number;
+  documentWidth: number;
+  zoomFactor: number;
 }> {
   return app.evaluate(async ({ BrowserWindow, session, webContents }) => {
     const window = BrowserWindow.getAllWindows()[0];
@@ -82,14 +94,63 @@ async function readerViewSnapshot(app: ElectronApplication): Promise<{
       getBounds(): { x: number; y: number; width: number; height: number };
     } | undefined;
     if (!view) throw new Error("Novel Viewer View was not attached");
+    const viewport = await reader.executeJavaScript(`({
+      scrollY: window.scrollY,
+      viewportWidth: window.innerWidth,
+      viewportHeight: window.innerHeight,
+      resizeEvents: Number(window.__novelViewerResizeEvents || 0),
+      documentWidth: Math.max(document.documentElement.scrollWidth, document.body?.scrollWidth || 0)
+    })`) as {
+      scrollY: number;
+      viewportWidth: number;
+      viewportHeight: number;
+      resizeEvents: number;
+      documentWidth: number;
+    };
     return {
       id: reader.id,
       visible: view.getVisible(),
       bounds: view.getBounds(),
       url: reader.getURL(),
-      scrollY: await reader.executeJavaScript("window.scrollY") as number
+      zoomFactor: reader.getZoomFactor(),
+      ...viewport
     };
   });
+}
+
+async function observeReaderResizeEvents(app: ElectronApplication): Promise<void> {
+  await app.evaluate(async ({ session, webContents }) => {
+    const readerSession = session.fromPartition("novel-viewer-reader");
+    const reader = webContents.getAllWebContents().find((contents) => !contents.isDestroyed() && contents.session === readerSession);
+    if (!reader) throw new Error("Novel Viewer was not found");
+    await reader.executeJavaScript(`
+      window.__novelViewerResizeEvents = 0;
+      window.addEventListener("resize", () => { window.__novelViewerResizeEvents += 1; });
+    `);
+  });
+}
+
+function viewportFitDiagnostic(snapshot: Awaited<ReturnType<typeof readerViewSnapshot>>): {
+  ready: boolean;
+  zoomFactor: number;
+  documentWidth: number;
+  boundsWidth: number;
+  viewportWidth: number;
+  viewportHeight: number;
+  narrow: boolean;
+  capturedAt: string;
+} {
+  return {
+    ready: snapshot.zoomFactor < 1 &&
+      snapshot.documentWidth * snapshot.zoomFactor <= snapshot.bounds.width + 2,
+    zoomFactor: snapshot.zoomFactor,
+    documentWidth: snapshot.documentWidth,
+    boundsWidth: snapshot.bounds.width,
+    viewportWidth: snapshot.viewportWidth,
+    viewportHeight: snapshot.viewportHeight,
+    narrow: snapshot.zoomFactor < 0.99,
+    capturedAt: new Date().toISOString()
+  };
 }
 
 async function setReaderScroll(app: ElectronApplication, scrollY: number): Promise<void> {
@@ -143,6 +204,56 @@ function fileSystemError(code: string): NodeJS.ErrnoException {
 }
 
 test.describe("Novel Viewer TOC adapters", () => {
+  test("normalizes supported episode URLs to work favorites and manages unique entries", () => {
+    expect(normalizeNovelViewerWorkUrl(
+      "https://kakuyomu.jp/works/16818792438097458603/episodes/16818792438220454136?from=test#body"
+    )).toEqual({
+      adapterId: "kakuyomu",
+      workId: "16818792438097458603",
+      canonicalWorkUrl: "https://kakuyomu.jp/works/16818792438097458603"
+    });
+    expect(normalizeNovelViewerWorkUrl("https://kakuyomu.jp/works/16818792438097458603")).toMatchObject({
+      canonicalWorkUrl: "https://kakuyomu.jp/works/16818792438097458603"
+    });
+    expect(normalizeNovelViewerWorkUrl("https://kakuyomu.jp/works/16818792438097458603/")).toMatchObject({
+      canonicalWorkUrl: "https://kakuyomu.jp/works/16818792438097458603"
+    });
+    expect(normalizeNovelViewerWorkUrl("https://ncode.syosetu.com/N8919MK/1/?from=test#body")).toEqual({
+      adapterId: "narou",
+      workId: "n8919mk",
+      canonicalWorkUrl: "https://ncode.syosetu.com/n8919mk/"
+    });
+    expect(normalizeNovelViewerWorkUrl("https://ncode.syosetu.com/n8919mk")).toMatchObject({
+      canonicalWorkUrl: "https://ncode.syosetu.com/n8919mk/"
+    });
+    expect(normalizeNovelViewerWorkUrl("https://ncode.syosetu.com/n8919mk/")).toMatchObject({
+      canonicalWorkUrl: "https://ncode.syosetu.com/n8919mk/"
+    });
+    expect(normalizeNovelViewerWorkUrl("https://example.com/works/123")).toBeNull();
+    expect(normalizeNovelViewerWorkUrl("not a url")).toBeNull();
+
+    const favorite: NovelViewerFavorite = {
+      adapterId: "kakuyomu",
+      workId: "16818792438097458603",
+      canonicalWorkUrl: "https://kakuyomu.jp/works/16818792438097458603",
+      workTitle: "Fixture Work",
+      addedAt: "2026-01-01T00:00:00.000Z"
+    };
+    const addedTwice = addNovelViewerFavorite(addNovelViewerFavorite([], favorite), {
+      ...favorite,
+      workTitle: "Updated Work",
+      addedAt: "2026-01-02T00:00:00.000Z"
+    });
+    expect(addedTwice).toHaveLength(1);
+    expect(addedTwice[0].workTitle).toBe("Updated Work");
+    expect(removeNovelViewerFavorite(addedTwice, favorite.canonicalWorkUrl)).toEqual([]);
+    expect(normalizeNovelViewerFavorites([
+      { ...favorite, canonicalWorkUrl: `${favorite.canonicalWorkUrl}/` },
+      { bad: true },
+      favorite
+    ])).toEqual([favorite]);
+  });
+
   test("matches canonical work and episode URLs without widening supported origins", () => {
     const kakuyomu = createKakuyomuAdapter();
     const narou = createNarouAdapter();
@@ -521,6 +632,159 @@ test.describe("Novel Viewer TOC cache and request generations", () => {
 });
 
 test.describe("Novel Viewer TOC Side Panel", () => {
+  test("synchronizes the remote viewport and bounds narrow fixed-width content without stale zoom", async ({}, testInfo) => {
+    const { app, page } = await launchTocApp(testInfo);
+    try {
+      await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0]?.setSize(760, 720));
+      await page.keyboard.press(process.platform === "darwin" ? "Meta+Shift+V" : "Control+Shift+V");
+      await expect(page.getByTestId("novel-viewer-pane")).toBeVisible();
+      const fixtureUrl = "novel-reader-test://fixture/viewport-wide";
+      await page.locator("#novel-viewer-address").fill(fixtureUrl);
+      await page.locator("#novel-viewer-address").press("Enter");
+      await expect.poll(() => page.locator("#novel-viewer-address").inputValue()).toBe(fixtureUrl);
+      await observeReaderResizeEvents(app);
+      await expect.poll(async () => {
+        return viewportFitDiagnostic(await readerViewSnapshot(app));
+      }).toMatchObject({ ready: true });
+      console.log("Novel Viewer narrow viewport:", viewportFitDiagnostic(await readerViewSnapshot(app)));
+
+      await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0]?.setSize(1_600, 820));
+      const mainSplitResizer = page.locator("#split-resizer");
+      await expect(mainSplitResizer).toBeVisible();
+      await mainSplitResizer.focus();
+      await mainSplitResizer.press("Home");
+      await expect.poll(async () => {
+        const snapshot = await readerViewSnapshot(app);
+        return {
+          ready: snapshot.zoomFactor === 1 &&
+            Math.abs(snapshot.viewportWidth - snapshot.bounds.width) <= 2 &&
+            Math.abs(snapshot.viewportHeight - snapshot.bounds.height) <= 2 &&
+            snapshot.documentWidth <= snapshot.viewportWidth + 2 &&
+            snapshot.resizeEvents > 0,
+          zoomFactor: snapshot.zoomFactor,
+          documentWidth: snapshot.documentWidth,
+          boundsWidth: snapshot.bounds.width,
+          viewportWidth: snapshot.viewportWidth,
+          viewportHeight: snapshot.viewportHeight,
+          narrow: snapshot.zoomFactor < 0.99,
+          capturedAt: new Date().toISOString()
+        };
+      }).toMatchObject({ ready: true });
+      console.log("Novel Viewer normal viewport:", viewportFitDiagnostic(await readerViewSnapshot(app)));
+
+      await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0]?.setSize(760, 720));
+      await expect.poll(async () => {
+        return viewportFitDiagnostic(await readerViewSnapshot(app));
+      }).toMatchObject({ ready: true });
+      console.log("Novel Viewer restored narrow viewport:", viewportFitDiagnostic(await readerViewSnapshot(app)));
+    } finally {
+      await closeApp(app);
+    }
+  });
+
+  test("stores work-level favorites, reopens the work page, and keeps narrow controls usable", async ({}, testInfo) => {
+    const { app, page, userDataDir } = await launchTocApp(testInfo);
+    try {
+      await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0]?.setSize(760, 720));
+      await openViewerAt(page, kakuyomuEpisodeOne);
+      await observeReaderResizeEvents(app);
+      const initialViewport = await readerViewSnapshot(app);
+      expect(Math.abs(initialViewport.viewportWidth - initialViewport.bounds.width)).toBeLessThanOrEqual(2);
+      expect(Math.abs(initialViewport.viewportHeight - initialViewport.bounds.height)).toBeLessThanOrEqual(2);
+      await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0]?.setSize(1_600, 820));
+      await expect.poll(async () => {
+        const snapshot = await readerViewSnapshot(app);
+        return Math.abs(snapshot.viewportWidth - snapshot.bounds.width) <= 2 &&
+          Math.abs(snapshot.viewportHeight - snapshot.bounds.height) <= 2 &&
+          snapshot.resizeEvents > 0 && snapshot.bounds.width > initialViewport.bounds.width;
+      }).toBe(true);
+      await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0]?.setSize(760, 720));
+      await expect.poll(async () => {
+        const snapshot = await readerViewSnapshot(app);
+        return Math.abs(snapshot.viewportWidth - snapshot.bounds.width) <= 2 &&
+          Math.abs(snapshot.viewportHeight - snapshot.bounds.height) <= 2 &&
+          snapshot.bounds.width <= initialViewport.bounds.width + 2;
+      }).toBe(true);
+      await expect(page.locator("#novel-viewer-favorites")).toBeVisible();
+      await expect(page.locator("#novel-viewer-favorites")).toHaveText("☆");
+      expect(await page.locator(".novel-viewer-header").evaluate((element) => element.scrollWidth <= element.clientWidth)).toBe(true);
+      expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+      expect((await page.locator("#novel-viewer-address").boundingBox())?.width ?? 0).toBeGreaterThan(30);
+
+      await page.locator("#novel-viewer-favorites").click();
+      await expect(page.locator(".novel-viewer-favorites-dialog")).toBeVisible();
+      await page.locator('[data-favorite-action="toggle"]').click();
+      await expect(page.locator("#novel-viewer-favorites")).toHaveText("★");
+      await expect(page.locator(".novel-viewer-favorite-row")).toHaveCount(1);
+
+      const expectedWorkUrl = "novel-reader-test://fixture/toc/kakuyomu/works/work-alpha";
+      const readerStatePath = path.join(userDataDir, "reader", "state.json");
+      await expect.poll(async () => {
+        const saved = JSON.parse(await readFile(readerStatePath, "utf8")) as {
+          favorites?: Array<{ canonicalWorkUrl?: string }>;
+        };
+        return saved.favorites?.map((entry) => entry.canonicalWorkUrl) ?? [];
+      }).toEqual([expectedWorkUrl]);
+
+      await page.locator('[data-favorite-action="open"]').click();
+      await expect(page.locator(".novel-viewer-favorites-dialog")).toBeHidden();
+      await expect.poll(() => page.locator("#novel-viewer-address").inputValue()).toBe(expectedWorkUrl);
+      await expect(page.locator("#novel-viewer-favorites")).toHaveText("★");
+
+      await page.locator("#novel-viewer-toc").click();
+      await expect(page.locator("#novel-viewer-content")).toHaveClass(/is-toc-narrow/);
+      await expect(page.locator("#novel-viewer-toc-panel")).toBeVisible();
+      await page.locator("#novel-viewer-toc-close").click();
+      await expect.poll(async () => (await readerViewSnapshot(app)).visible).toBe(true);
+
+      await page.locator("#novel-viewer-favorites").click();
+      await page.locator('[data-favorite-action="remove"]').click();
+      await expect(page.locator(".novel-viewer-favorite-row")).toHaveCount(0);
+      await expect(page.locator("#novel-viewer-favorites")).toHaveText("☆");
+      await expect.poll(async () => {
+        const saved = JSON.parse(await readFile(readerStatePath, "utf8")) as { favorites?: unknown[] };
+        return saved.favorites?.length ?? -1;
+      }).toBe(0);
+    } finally {
+      await closeApp(app);
+    }
+  });
+
+  test("migrates and opens a legacy slash-suffixed Kakuyomu favorite", async ({}, testInfo) => {
+    const legacyWorkUrl = "novel-reader-test://fixture/toc/kakuyomu/works/work-alpha/";
+    const canonicalWorkUrl = "novel-reader-test://fixture/toc/kakuyomu/works/work-alpha";
+    const { app, page, userDataDir } = await launchTocApp(testInfo, async (directory) => {
+      const readerDirectory = path.join(directory, "reader");
+      await mkdir(readerDirectory, { recursive: true });
+      await writeFile(path.join(readerDirectory, "state.json"), `${JSON.stringify({
+        ...defaultReaderState,
+        favorites: [{
+          adapterId: "kakuyomu",
+          workId: "work-alpha",
+          canonicalWorkUrl: legacyWorkUrl,
+          workTitle: "Legacy Fixture Work",
+          addedAt: "2026-01-01T00:00:00.000Z"
+        }]
+      }, null, 2)}\n`, "utf8");
+    });
+    try {
+      await openViewerAt(page, kakuyomuEpisodeTwo);
+      await expect(page.locator("#novel-viewer-favorites")).toHaveText("★");
+      await page.locator("#novel-viewer-favorites").click();
+      await expect(page.locator(".novel-viewer-favorite-row")).toHaveCount(1);
+      await page.locator('[data-favorite-action="open"]').click();
+      await expect.poll(() => page.locator("#novel-viewer-address").inputValue()).toBe(canonicalWorkUrl);
+      await expect.poll(async () => {
+        const saved = JSON.parse(await readFile(path.join(userDataDir, "reader", "state.json"), "utf8")) as {
+          favorites?: Array<{ canonicalWorkUrl?: string }>;
+        };
+        return saved.favorites?.[0]?.canonicalWorkUrl;
+      }).toBe(canonicalWorkUrl);
+    } finally {
+      await closeApp(app);
+    }
+  });
+
   test("loads Kakuyomu fixture, resizes independent split boundaries, and navigates by episode identity", async ({}, testInfo) => {
     const { app, page, userDataDir } = await launchTocApp(testInfo);
     try {
@@ -611,6 +875,8 @@ test.describe("Novel Viewer TOC Side Panel", () => {
       expect(remoteAfterMainSplit.url).toBe(remoteBeforeMainSplit.url);
       expect(remoteAfterMainSplit.scrollY).toBe(remoteBeforeMainSplit.scrollY);
       expect(remoteAfterMainSplit.bounds.width).toBeLessThan(remoteBeforeMainSplit.bounds.width);
+      expect(Math.abs(remoteAfterMainSplit.viewportWidth - remoteAfterMainSplit.bounds.width)).toBeLessThanOrEqual(2);
+      expect(Math.abs(remoteAfterMainSplit.viewportHeight - remoteAfterMainSplit.bounds.height)).toBeLessThanOrEqual(2);
       expect(Math.round((await page.locator("#novel-viewer-toc-panel").boundingBox())?.width ?? 0)).toBe(tocWidthBeforeMainSplit);
       await dragSeparatorBy(page, "#split-resizer", -140);
       const editorAfterShrink = await page.locator('section.editor-pane[data-pane-id="left"]').boundingBox();
@@ -695,6 +961,8 @@ test.describe("Novel Viewer TOC Side Panel", () => {
       expect(restored.url).toBe(beforeNarrow.url);
       expect(restored.scrollY).toBe(beforeNarrow.scrollY);
       expect(restored.bounds.width).toBeGreaterThan(0);
+      expect(Math.abs(restored.viewportWidth - restored.bounds.width)).toBeLessThanOrEqual(2);
+      expect(Math.abs(restored.viewportHeight - restored.bounds.height)).toBeLessThanOrEqual(2);
       await page.locator("#novel-viewer-toc").click();
       await expect(page.locator("#novel-viewer-content")).toHaveClass(/is-toc-narrow/);
       await page.locator('.novel-viewer-toc-episode[data-episode-id="episode-1"]').click();

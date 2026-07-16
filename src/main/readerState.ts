@@ -8,6 +8,7 @@ import {
   type ReaderScrollState,
   type ReaderState
 } from "../shared/novelViewer.js";
+import { normalizeNovelViewerFavorites } from "../shared/novelViewerFavorites.js";
 
 const MAX_SCROLL_VALUE = 100_000_000;
 
@@ -17,7 +18,8 @@ export const defaultReaderState: ReaderState = {
   ui: {
     wasOpen: false,
     preferredPane: "right"
-  }
+  },
+  favorites: []
 };
 
 function optionalString(value: unknown, maximumLength: number, field: string): string | undefined {
@@ -108,7 +110,8 @@ export function normalizeReaderState(value: unknown): ReaderState {
       preferredPane: ui.preferredPane,
       ...(tocWidthPx === undefined ? {} : { tocWidthPx }),
       ...(novelViewerSplitRatio === undefined ? {} : { novelViewerSplitRatio })
-    }
+    },
+    favorites: normalizeNovelViewerFavorites(root.favorites, { allowTestProtocol: true })
   };
 }
 

@@ -62,6 +62,7 @@ export interface ReaderState {
     tocWidthPx?: number;
     novelViewerSplitRatio?: number;
   };
+  favorites: NovelViewerFavorite[];
 }
 
 export interface NovelViewerStatus {
@@ -80,6 +81,21 @@ export interface NovelViewerStatus {
 }
 
 export type NovelViewerAdapterId = "kakuyomu" | "narou";
+
+export interface NovelViewerFavorite {
+  adapterId: NovelViewerAdapterId;
+  workId: string;
+  canonicalWorkUrl: string;
+  workTitle: string;
+  addedAt: string;
+}
+
+export interface NovelViewerFavoritesState {
+  items: NovelViewerFavorite[];
+  supported: boolean;
+  currentWorkUrl?: string;
+  currentFavorite: boolean;
+}
 
 export interface NovelViewerWorkIdentity {
   adapterId: NovelViewerAdapterId;

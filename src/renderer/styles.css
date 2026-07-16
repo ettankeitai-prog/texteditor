@@ -520,6 +520,7 @@ body.is-resizing {
 }
 
 .novel-viewer-pane {
+  container: novel-viewer / inline-size;
   display: grid;
   grid-template-rows: 50px minmax(0, 1fr);
   min-width: 0;
@@ -539,7 +540,7 @@ body.is-resizing {
 
 .novel-viewer-header {
   display: grid;
-  grid-template-columns: 30px 30px 30px 30px minmax(80px, 1fr) 30px 30px;
+  grid-template-columns: repeat(5, 30px) minmax(80px, 1fr) 30px 30px;
   align-items: center;
   gap: 4px;
   min-width: 0;
@@ -779,6 +780,106 @@ body.is-novel-viewer-toc-resizing {
   background: var(--active);
   color: var(--accent);
   font-weight: 600;
+}
+
+.novel-viewer-favorites-dialog {
+  display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr) auto;
+  max-height: min(620px, calc(100vh - 32px));
+  overflow: hidden;
+}
+
+.novel-viewer-favorite-toggle {
+  justify-self: start;
+  min-height: 28px;
+  margin-bottom: 10px;
+  padding: 0 10px;
+  border-color: var(--border);
+  background: var(--panel-2);
+}
+
+.novel-viewer-favorites-list {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+  min-height: 48px;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.novel-viewer-favorite-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  padding: 7px 8px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg);
+}
+
+.novel-viewer-favorite-details,
+.novel-viewer-favorite-actions {
+  min-width: 0;
+}
+
+.novel-viewer-favorite-title {
+  overflow: hidden;
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.novel-viewer-favorite-details small {
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.novel-viewer-favorite-actions {
+  display: flex;
+  gap: 4px;
+}
+
+.novel-viewer-favorite-actions button {
+  min-height: 26px;
+  padding: 0 7px;
+  white-space: nowrap;
+}
+
+.novel-viewer-favorites-empty {
+  margin: 0;
+}
+
+@container novel-viewer (max-width: 520px) {
+  .novel-viewer-header {
+    grid-template-columns: repeat(5, 26px) minmax(38px, 1fr) 26px 26px;
+    gap: 2px;
+    padding-inline: 3px;
+  }
+
+  .novel-viewer-button {
+    width: 24px;
+    height: 26px;
+    font-size: 14px;
+  }
+
+  .novel-viewer-address {
+    height: 28px;
+    padding-inline: 5px;
+  }
+
+  .novel-viewer-favorite-row {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 5px;
+  }
+
+  .novel-viewer-favorite-actions {
+    flex-wrap: wrap;
+  }
 }
 
 .novel-viewer-local-state {

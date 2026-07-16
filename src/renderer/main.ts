@@ -39,6 +39,7 @@ import {
   NOVEL_VIEWER_TOC_WIDTH_DEFAULT,
   NOVEL_VIEWER_TOC_WIDTH_MAX,
   NOVEL_VIEWER_TOC_WIDTH_MIN,
+  type NovelViewerFavoritesState,
   type NovelViewerUiLayoutUpdate,
   type NovelViewerOcclusionReason,
   type NovelViewerRendererDiagnosticSnapshot,
@@ -137,6 +138,7 @@ app.innerHTML = `
               <button type="button" class="novel-viewer-button" id="novel-viewer-forward" data-action="novel-viewer-forward" aria-label="Forward" title="Forward">→</button>
               <button type="button" class="novel-viewer-button" id="novel-viewer-reload" data-action="novel-viewer-reload" aria-label="Reload" title="Reload">↻</button>
               <button type="button" class="novel-viewer-button" id="novel-viewer-toc" data-action="novel-viewer-toc-toggle" aria-label="Table of contents" title="Table of contents">☰</button>
+              <button type="button" class="novel-viewer-button" id="novel-viewer-favorites" data-action="novel-viewer-favorites" aria-label="Favorites" title="Favorites">☆</button>
               <input class="novel-viewer-address" id="novel-viewer-address" type="text" inputmode="url" autocomplete="off" spellcheck="false" aria-label="Novel Viewer URL" placeholder="https://kakuyomu.jp/…" />
               <button type="button" class="novel-viewer-button" id="novel-viewer-external" data-action="novel-viewer-external" aria-label="Open in external browser" title="Open in external browser">↗</button>
               <button type="button" class="novel-viewer-button" id="novel-viewer-close" data-action="novel-viewer-close" aria-label="Close Novel Viewer" title="Close Novel Viewer">×</button>
@@ -195,6 +197,7 @@ const novelViewerBack = document.querySelector<HTMLButtonElement>("#novel-viewer
 const novelViewerForward = document.querySelector<HTMLButtonElement>("#novel-viewer-forward")!;
 const novelViewerReload = document.querySelector<HTMLButtonElement>("#novel-viewer-reload")!;
 const novelViewerToc = document.querySelector<HTMLButtonElement>("#novel-viewer-toc")!;
+const novelViewerFavorites = document.querySelector<HTMLButtonElement>("#novel-viewer-favorites")!;
 const novelViewerExternal = document.querySelector<HTMLButtonElement>("#novel-viewer-external")!;
 const novelViewerClose = document.querySelector<HTMLButtonElement>("#novel-viewer-close")!;
 const novelViewerTocPanel = document.querySelector<HTMLElement>("#novel-viewer-toc-panel")!;
@@ -265,6 +268,11 @@ let novelViewerTocState: NovelViewerTocState = {
   cached: false,
   stale: false,
   canRefresh: false
+};
+let novelViewerFavoritesState: NovelViewerFavoritesState = {
+  items: [],
+  supported: false,
+  currentFavorite: false
 };
 let lastPlaceholderDiagnosticSignature = "";
 let novelViewerStatus: NovelViewerStatus = {
@@ -1620,6 +1628,13 @@ function novelViewerText() {
         external: "外部ブラウザで開く",
         close: "Novel Viewerを閉じる",
         toc: "目次",
+        favorites: "お気に入り",
+        favoritesRegistered: "お気に入り（登録済み）",
+        favoriteAdd: "現在の作品を追加",
+        favoriteRemove: "現在の作品を解除",
+        favoriteOpen: "作品トップを開く",
+        favoriteDelete: "削除",
+        favoriteEmpty: "お気に入りはありません。",
         tocRefresh: "目次を更新",
         tocClose: "目次を閉じる",
         tocResize: "目次パネルの幅を変更",
@@ -1645,6 +1660,13 @@ function novelViewerText() {
         external: "Open in external browser",
         close: "Close Novel Viewer",
         toc: "Table of contents",
+        favorites: "Favorites",
+        favoritesRegistered: "Favorites (saved)",
+        favoriteAdd: "Add current work",
+        favoriteRemove: "Remove current work",
+        favoriteOpen: "Open work page",
+        favoriteDelete: "Delete",
+        favoriteEmpty: "No favorites yet.",
         tocRefresh: "Refresh table of contents",
         tocClose: "Close table of contents",
         tocResize: "Resize table of contents",
@@ -1671,6 +1693,7 @@ function applyNovelViewerLabels(): void {
     [novelViewerForward, label.forward],
     [novelViewerReload, novelViewerStatus.loading ? label.stop : label.reload],
     [novelViewerToc, label.toc],
+    [novelViewerFavorites, novelViewerFavoritesState.currentFavorite ? label.favoritesRegistered : label.favorites],
     [novelViewerExternal, label.external],
     [novelViewerClose, label.close],
     [novelViewerTocRefresh, label.tocRefresh],
@@ -1691,6 +1714,132 @@ function applyNovelViewerLabels(): void {
     splitResizer.setAttribute("title", label.editorSplitResize);
   }
   novelViewerTocHeading.textContent = label.toc;
+}
+
+function renderNovelViewerFavoritesState(state = novelViewerFavoritesState): void {
+  novelViewerFavoritesState = state;
+  novelViewerFavorites.textContent = state.currentFavorite ? "★" : "☆";
+  novelViewerFavorites.classList.toggle("is-active", state.currentFavorite);
+  novelViewerFavorites.disabled = !novelViewerOpen;
+  applyNovelViewerLabels();
+  const overlay = document.querySelector<HTMLElement>(".novel-viewer-favorites-overlay");
+  if (overlay) renderNovelViewerFavoritesDialog(overlay);
+}
+
+function renderNovelViewerFavoritesDialog(overlay: HTMLElement): void {
+  const label = novelViewerText();
+  const toggle = overlay.querySelector<HTMLButtonElement>('[data-favorite-action="toggle"]');
+  const list = overlay.querySelector<HTMLElement>(".novel-viewer-favorites-list");
+  if (!toggle || !list) return;
+  toggle.disabled = !novelViewerFavoritesState.supported;
+  toggle.textContent = novelViewerFavoritesState.currentFavorite ? label.favoriteRemove : label.favoriteAdd;
+  list.replaceChildren();
+  if (novelViewerFavoritesState.items.length === 0) {
+    const empty = document.createElement("p");
+    empty.className = "dialog-note novel-viewer-favorites-empty";
+    empty.textContent = label.favoriteEmpty;
+    list.append(empty);
+    return;
+  }
+  for (const favorite of novelViewerFavoritesState.items) {
+    const row = document.createElement("div");
+    row.className = "novel-viewer-favorite-row";
+
+    const details = document.createElement("div");
+    details.className = "novel-viewer-favorite-details";
+    const title = document.createElement("div");
+    title.className = "novel-viewer-favorite-title";
+    title.textContent = favorite.workTitle;
+    title.title = favorite.workTitle;
+    const site = document.createElement("small");
+    site.textContent = favorite.adapterId === "kakuyomu" ? label.tocSiteKakuyomu : label.tocSiteNarou;
+    details.append(title, site);
+
+    const actions = document.createElement("div");
+    actions.className = "novel-viewer-favorite-actions";
+    const open = document.createElement("button");
+    open.type = "button";
+    open.dataset.favoriteAction = "open";
+    open.dataset.url = favorite.canonicalWorkUrl;
+    open.textContent = label.favoriteOpen;
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "secondary-button";
+    remove.dataset.favoriteAction = "remove";
+    remove.dataset.url = favorite.canonicalWorkUrl;
+    remove.textContent = label.favoriteDelete;
+    actions.append(open, remove);
+    row.append(details, actions);
+    list.append(row);
+  }
+}
+
+async function openNovelViewerFavoritesDialog(): Promise<void> {
+  novelViewerFavoritesState = await window.textEditor.getNovelViewerFavorites();
+  document.querySelector(".dialog-overlay")?.remove();
+  const label = novelViewerText();
+  const overlay = document.createElement("div");
+  overlay.className = "dialog-overlay novel-viewer-favorites-overlay";
+  const dialog = document.createElement("div");
+  dialog.className = "app-dialog large-dialog novel-viewer-favorites-dialog";
+  dialog.setAttribute("role", "dialog");
+  dialog.setAttribute("aria-modal", "true");
+  dialog.setAttribute("aria-labelledby", "novel-viewer-favorites-title");
+  const title = document.createElement("div");
+  title.className = "dialog-title";
+  title.id = "novel-viewer-favorites-title";
+  title.textContent = label.favorites;
+  const toggle = document.createElement("button");
+  toggle.type = "button";
+  toggle.className = "novel-viewer-favorite-toggle";
+  toggle.dataset.favoriteAction = "toggle";
+  const list = document.createElement("div");
+  list.className = "novel-viewer-favorites-list";
+  const dialogActions = document.createElement("div");
+  dialogActions.className = "dialog-actions";
+  const close = document.createElement("button");
+  close.type = "button";
+  close.dataset.dialogAction = "cancel";
+  close.textContent = text().close;
+  dialogActions.append(close);
+  dialog.append(title, toggle, list, dialogActions);
+  overlay.append(dialog);
+  overlay.addEventListener("click", (event) => {
+    if (event.target === overlay) overlay.remove();
+  });
+  close.addEventListener("click", () => overlay.remove());
+  toggle.addEventListener("click", () => {
+    toggle.disabled = true;
+    void window.textEditor.toggleNovelViewerFavorite().then(renderNovelViewerFavoritesState, (error: unknown) => {
+      console.error("Failed to update Novel Viewer favorite:", error);
+      renderNovelViewerFavoritesDialog(overlay);
+    });
+  });
+  list.addEventListener("click", (event) => {
+    const source = event.target instanceof HTMLElement
+      ? event.target.closest<HTMLButtonElement>("button[data-favorite-action]")
+      : null;
+    const url = source?.dataset.url;
+    if (!source || !url) return;
+    source.disabled = true;
+    if (source.dataset.favoriteAction === "remove") {
+      void window.textEditor.removeNovelViewerFavorite(url).then(renderNovelViewerFavoritesState, (error: unknown) => {
+        console.error("Failed to remove Novel Viewer favorite:", error);
+        renderNovelViewerFavoritesDialog(overlay);
+      });
+    } else if (source.dataset.favoriteAction === "open") {
+      void window.textEditor.openNovelViewerFavorite(url).then((status) => {
+        overlay.remove();
+        renderNovelViewerStatus(status);
+      }, (error: unknown) => {
+        console.error("Failed to open Novel Viewer favorite:", error);
+        source.disabled = false;
+      });
+    }
+  });
+  document.body.append(overlay);
+  renderNovelViewerFavoritesDialog(overlay);
+  toggle.focus();
 }
 
 function renderNovelViewerTocState(state = novelViewerTocState): void {
@@ -4665,6 +4814,7 @@ async function performAction(
   else if (action === "novel-viewer-forward") renderNovelViewerStatus(await window.textEditor.goForwardNovelViewer());
   else if (action === "novel-viewer-reload") renderNovelViewerStatus(await window.textEditor.reloadOrStopNovelViewer());
   else if (action === "novel-viewer-toc-toggle") await toggleNovelViewerToc();
+  else if (action === "novel-viewer-favorites") await openNovelViewerFavoritesDialog();
   else if (action === "novel-viewer-toc-close") await closeNovelViewerToc();
   else if (action === "novel-viewer-toc-refresh") await refreshNovelViewerToc();
   else if (action === "novel-viewer-toc-episode") await selectNovelViewerTocEpisode(source);
@@ -5078,6 +5228,9 @@ window.textEditor.onNovelViewerState((status) => {
 });
 window.textEditor.onNovelViewerTocState((state) => {
   renderNovelViewerTocState(state);
+});
+window.textEditor.onNovelViewerFavoritesState((state) => {
+  renderNovelViewerFavoritesState(state);
 });
 
 window.textEditor.onNovelViewerFocusAddress(() => focusNovelViewerAddress());

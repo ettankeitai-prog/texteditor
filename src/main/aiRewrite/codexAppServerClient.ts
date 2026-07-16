@@ -174,7 +174,7 @@ export class CodexAppServerClient {
         clientInfo: {
           name: "texteditor_ai_rewrite",
           title: "Text Editor AI Rewrite",
-          version: "2.1.0"
+          version: "2.2.0"
         }
       }, INITIALIZE_TIMEOUT_MS);
       this.notify("initialized", {});

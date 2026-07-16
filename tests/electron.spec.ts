@@ -146,7 +146,7 @@ async function createGroupFromSidebarBlank(page: Page) {
   await page.getByRole("button", { name: "New Group" }).click();
 }
 
-test.describe("Text Editor Electron v2.1.0", () => {
+test.describe("Text Editor Electron v2.2.0", () => {
   test.describe("undo and redo history", () => {
     test("undoes and redoes basic input", async ({}, testInfo) => {
       const { app, page } = await launchTextEditor(testInfo);

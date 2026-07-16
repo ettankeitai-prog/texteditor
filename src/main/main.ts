@@ -41,6 +41,7 @@ import { ReaderStateStore } from "./readerState.js";
 import { NovelViewerTocCache } from "./novelViewer/novelViewerTocCache.js";
 import type {
   NovelViewerBoundsUpdate,
+  NovelViewerFavoritesState,
   NovelViewerOcclusionUpdate,
   NovelViewerRendererDiagnosticSnapshot,
   NovelViewerStartupState,
@@ -1496,6 +1497,28 @@ ipcMain.handle("novel-viewer:toc-close", async (event): Promise<NovelViewerTocSt
 ipcMain.handle("novel-viewer:toc-refresh", async (event): Promise<NovelViewerTocState> =>
   assertTrustedEditorSender(event).refreshToc()
 );
+
+ipcMain.handle("novel-viewer:favorites-get", async (event): Promise<NovelViewerFavoritesState> =>
+  assertTrustedEditorSender(event).favoritesState
+);
+
+ipcMain.handle("novel-viewer:favorites-toggle", async (event): Promise<NovelViewerFavoritesState> =>
+  assertTrustedEditorSender(event).toggleFavorite()
+);
+
+ipcMain.handle("novel-viewer:favorites-remove", async (event, canonicalWorkUrl: string): Promise<NovelViewerFavoritesState> => {
+  if (typeof canonicalWorkUrl !== "string" || canonicalWorkUrl.length === 0 || canonicalWorkUrl.length > 4096) {
+    throw new Error("Invalid Novel Viewer favorite URL.");
+  }
+  return assertTrustedEditorSender(event).removeFavorite(canonicalWorkUrl);
+});
+
+ipcMain.handle("novel-viewer:favorites-open", async (event, canonicalWorkUrl: string): Promise<NovelViewerStatus> => {
+  if (typeof canonicalWorkUrl !== "string" || canonicalWorkUrl.length === 0 || canonicalWorkUrl.length > 4096) {
+    throw new Error("Invalid Novel Viewer favorite URL.");
+  }
+  return assertTrustedEditorSender(event).openFavorite(canonicalWorkUrl);
+});
 
 ipcMain.handle(
   "novel-viewer:toc-select-episode",

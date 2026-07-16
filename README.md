@@ -2,6 +2,19 @@
 
 Electron + TypeScript + CodeMirror 6 で作成した、軽量な小説・日常メモ用テキストエディタです。
 
+## v2.2.0
+
+v2.2.0 は、Novel Viewerへ作品単位のお気に入りと、狭いペインでも本文を読みやすく保つviewport同期を追加するリリースです。
+
+- カクヨム／小説家になろうの作品を、エピソード表示中から作品単位でお気に入りへ追加可能
+- お気に入り一覧から作品トップを開き、作品名・サイト名・追加日時を確認可能
+- カクヨムは末尾スラッシュなし、なろうは末尾スラッシュありのcanonical作品URLへ正規化
+- 旧形式の末尾スラッシュ付きカクヨムお気に入りも読み込み時に正規化して利用可能
+- お気に入りはReader専用stateへ保存し、通常文書タブ・Workspace Export／Importから分離
+- Viewerの実boundsとremote viewportをresize・分割変更・再表示時に同期
+- 固定幅ページが狭いViewerからはみ出す場合だけzoomを調整し、十分な幅へ戻ると100%へ復元
+- navigation generationとlayout revisionにより、古い非同期viewport計測結果を破棄
+
 ## v2.1.0
 
 v2.1.0 は、選択範囲またはタブ全文を人が確認してから適用できる「AI文章整形」を追加するリリースです。
@@ -87,8 +100,8 @@ npm run dist
 
 ```text
 dist/
-  Text Editor Setup 2.1.0.exe
-  Text Editor 2.1.0.exe
+  Text Editor Setup 2.2.0.exe
+  Text Editor 2.2.0.exe
 ```
 
 開発中にレンダラーだけ確認する場合:
@@ -571,7 +584,7 @@ version.json
 
 ```json
 {
-  "appVersion": "2.1.0",
+  "appVersion": "2.2.0",
   "workspaceVersion": 1,
   "createdAt": "2026-07-08T12:00:00.000Z"
 }
